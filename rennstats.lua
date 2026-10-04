@@ -1,4 +1,4 @@
--- RennStats 1.4 | headless inventory collector and website-controlled trade.
+-- RennStats 1.4.1 | headless inventory collector and website-controlled trade.
 -- Backup: lua/backups/renn-inventory-before-rennstats-20261004.lua
 -- Set getgenv()._rennkey before executing. API: https://rennstats.rennhsg.my.id.
 local Core = (function()
@@ -1791,6 +1791,56 @@ local Core = (function()
         return nil
     end
     function M.isEquipmentPath(value) return equipmentPath(value) ~= nil end
+    -- Only changes to fields used by the inventory/equipment projection cancel a read.
+    -- Countdown/coordinate values remain in the live profile and event mirror.
+    local function sourcePath(value)
+        local parts = {}
+        if type(value) == "string" then
+            for key in value:gmatch("[^%.]+") do table.insert(parts, tonumber(key) or key) end
+        elseif type(value) == "table" then
+            for _, key in ipairs(value) do
+                if type(key) ~= "string" and type(key) ~= "number" then return nil end
+                table.insert(parts, key)
+                if #parts > 24 then return nil end
+            end
+        else return nil end
+        return parts
+    end
+    function M.equipmentChangeRelevant(value, remote, update)
+        local path = sourcePath(value)
+        if not path then return true end -- Unknown notifications invalidate conservatively.
+        if path[1] == "Data" or path[1] == "Profile" then table.remove(path, 1) end
+        local function annotation(parts)
+            return parts[1] == "EquippedPotions" and tonumber(parts[2]) ~= nil and parts[3] == "Expires"
+                or parts[1] == "Loadout" and (parts[2] == "LastCoordinate"
+                    or parts[2] == "LastCharacterCoordinate" or parts[2] == "LastCharacterLocationName")
+        end
+        if annotation(path) then return false end
+        if remote == "Update" and type(update) == "table" then
+            local found = false
+            for key in pairs(update) do
+                found = true
+                local child = table.clone(path); table.insert(child, key)
+                if not annotation(child) then return true end
+            end
+            if found then return false end
+        end
+        return true
+    end
+    function M.sourceChangeRelevant(value, inventoryPaths, channel)
+        local path = sourcePath(value)
+        if not path or #path == 0 then return true end
+        if channel == "Inventory" then return true end
+        for _, candidate in ipairs(inventoryPaths) do
+            local matches = true
+            for index = 1, math.min(#path, #candidate) do
+                if path[index] ~= candidate[index] then matches = false; break end
+            end
+            if matches then return true end -- Match the whole prefix, including replacements of ancestors.
+        end
+        return M.isEquipmentPath(value) and M.equipmentChangeRelevant(value) or false
+    end
+
     function M.tradeChoices(inventory, catalog, prepared, checkpoint)
         local flat = prepared or M.normalize(inventory or {}, catalog, {CollectRecords = true, Checkpoint = checkpoint})
         local byKey, canonicalRows = {}, {}
@@ -2041,7 +2091,7 @@ local Core = (function()
         return result -- A local delta alone never proves a completed trade or recipient ownership.
     end
     function M.equipmentEvents()
-        return {profiles = {}, excludedIds = {}, accepted = 0}
+        return {profiles = {}, excludedIds = {}, accepted = 0, revision = 0, passiveUpdates = 0}
     end
     function M.observeEquipment(store, remote, args, options)
         if remote == "Added" then
@@ -2051,13 +2101,16 @@ local Core = (function()
                     local owns, proof = M.profileScope(serialized[3], options.LocalUserId, serialized[2], serialized[4] == "All", options.PersonalChannels)
                     if owns then
                         local data = M.copyData(serialized[3], options.MaxNodes)
-                        if data then store.profiles[serialized[1]] = {data = data, verified = true, scopeReason = proof}; store.excludedIds[serialized[1]] = nil; store.accepted = store.accepted + 1 end
+                        if data then store.profiles[serialized[1]] = {data = data, verified = true, scopeReason = proof}; store.excludedIds[serialized[1]] = nil; store.accepted = store.accepted + 1; store.revision = (store.revision or 0) + 1 end
                     else store.excludedIds[serialized[1]] = true; store.profiles[serialized[1]] = nil end
                 end
             end
             return
         end
-        if remote == "Removed" then store.profiles[args[1]] = nil; return end
+        if remote == "Removed" then
+            if store.profiles[args[1]] then store.revision = (store.revision or 0) + 1 end
+            store.profiles[args[1]] = nil; return
+        end
         if args[1] == nil or store.excludedIds[args[1]] then return end
         local path = equipmentPath(remote == "ArrayUpdate" and args[3] or args[2])
         if not path then
@@ -2095,6 +2148,9 @@ local Core = (function()
             else return end
         else return end
         store.profiles[args[1]] = profile; store.accepted = store.accepted + 1
+        if M.equipmentChangeRelevant(path, remote, args[3]) then
+            store.revision = (store.revision or 0) + 1
+        else store.passiveUpdates = (store.passiveUpdates or 0) + 1 end
     end
     -- GUI visibility is never evidence of removal. Keep an account-bound bag independently of widgets.
     function M.bagLedger(userId)
@@ -2395,7 +2451,7 @@ local state = {
     observed = Core.eventStore(), equipmentObserved = Core.equipmentEvents(), remoteCount = 0, partial = true,
     cacheReaderProbes = {},
     bag = Core.bagLedger(player.UserId),
-    playerGui = playerGui, revision = 0, statsRevision = 0,
+    playerGui = playerGui, revision = 0, statsRevision = 0, collectorVersion = "1.4.1",
 }
 if reuse then
     state.bag = previous.bag; Core.bagReindex(state.bag, state.catalog)
@@ -2755,15 +2811,11 @@ local function bindSource(replion)
     state.replion = replion
     local function changed(_, path)
         if not state.alive then return end
-        -- Replion also reports coins/stats. Only known inventory paths need a rescan.
-        if replion._channel ~= "Inventory" and type(path) == "table" and type(path[1]) == "string" then
-            local matches = false
-            if Core.isEquipmentPath(path) then matches = true end
-            for _, candidate in ipairs(CONFIG.InventoryPaths) do
-                if path[1] == candidate[1] then matches = true; break end
-            end
-            if not matches then return end
+        if not Core.sourceChangeRelevant(path, CONFIG.InventoryPaths, replion._channel) then
+            state.sourcePassiveUpdates = (state.sourcePassiveUpdates or 0) + 1
+            return
         end
+        state.sourceRelevantUpdates = (state.sourceRelevantUpdates or 0) + 1
         invalidateRead()
         if state.paused or state.queued then return end
         state.queued = true
@@ -3406,7 +3458,9 @@ refresh = function(force)
                 Core.bagReplace(nextBag, inventory, state.catalog, "Inventory", flat, checkpoint)
             end
             if not state.alive then return end
-            if generation ~= (state.inputGeneration or 0) then state.pendingRefresh = true; return end
+            if generation ~= (state.inputGeneration or 0) then
+                state.discardedReads = (state.discardedReads or 0) + 1; state.pendingRefresh = true; return
+            end
             if nextBag then state.bag = nextBag end
             state.currentInventory = inventory
             state.completedRead = {inventory = inventory, flat = flat, generation = generation, catalog = state.catalog}
@@ -3415,7 +3469,8 @@ refresh = function(force)
             snapshot.partial = partial
             snapshot.catalogReady = state.catalogReady
             snapshot.definitionRequests = nil; snapshot.definitionKeys = nil
-            snapshot.mappingComplete = state.catalogLabelsReady == true and snapshot.unresolved == 0 and snapshot.missingIcons == 0
+            snapshot.mappingComplete = partial == false and snapshot.truncated ~= true and state.catalogLabelsReady == true
+                and snapshot.unresolved == 0 and snapshot.missingIcons == 0
             local mutationData=snapshot.mutationDiagnostics
             snapshot.mutationMappingComplete = not partial and mutationData.unmapped==0 and mutationData.invalid==0 and mutationData.unknown==0
             snapshot.cached = readMetadata and readMetadata.cached or false
@@ -3883,8 +3938,9 @@ local function startInventoryObserver()
             local equipOk, equipError = pcall(Core.observeEquipment, state.equipmentObserved, instance.Name, args, options)
             if not equipOk then state.equipmentError = tostring(equipError) end
             local previousEquipEvents = state.lastEquipmentEvents or 0
-            local equipmentChanged = state.equipmentObserved.accepted ~= previousEquipEvents
-            state.lastEquipmentEvents = state.equipmentObserved.accepted
+            local equipmentRevision = state.equipmentObserved.revision or state.equipmentObserved.accepted
+            local equipmentChanged = equipmentRevision ~= previousEquipEvents
+            state.lastEquipmentEvents = equipmentRevision
             local ok, changed
             if state.catalogReady then
                 ok, changed = pcall(Core.observeBag, state.observed, state.bag, instance.Name, args, options, state.catalog)
@@ -4131,7 +4187,7 @@ do
     local function metadata(snapshot)
         local ctx = state.autoTrade
         return {username = player.Name, displayName = player.DisplayName, placeId = game.PlaceId, gameId = game.GameId,
-            jobId = game.JobId, version = "rennstats/1.4", source = state.source, status = state.status,
+            jobId = game.JobId, version = "rennstats/1.4.1", source = state.source, status = state.status,
             paused = state.paused, lastError = state.lastError, catalogReady = state.catalogReady,
             playerStats = snapshot and snapshot.playerStats or state.playerStats,
             equipment = snapshot and snapshot.equipment or {},
@@ -4143,7 +4199,7 @@ do
     local function briefMetadata()
         local snapshot = state.snapshot
         return {username = player.Name, displayName = player.DisplayName, placeId = game.PlaceId,
-            gameId = game.GameId, jobId = game.JobId, version = "rennstats/1.3",
+            gameId = game.GameId, jobId = game.JobId, version = "rennstats/1.4.1",
             playerStats = snapshot and snapshot.playerStats or state.playerStats, equipment = snapshot and snapshot.equipment or {},
             progress = {phase = not snapshot and "Mengambil inventori" or state.DataReady() and "Siap" or "Memetakan informasi item",
                 complete = state.DataReady()}}
