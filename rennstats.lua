@@ -1,4 +1,4 @@
--- RennStats 1.5 | headless inventory collector and website-controlled trade.
+-- RennStats 1.6 | headless inventory collector and website-controlled trade.
 -- Backup: lua/backups/renn-inventory-before-rennstats-20261004.lua
 -- Set getgenv()._rennkey before executing. API: https://rennstats.rennhsg.my.id.
 local Core = (function()
@@ -2545,7 +2545,7 @@ local state = {
     observed = Core.eventStore(), equipmentObserved = Core.equipmentEvents(), remoteCount = 0, partial = true,
     cacheReaderProbes = {},
     bag = Core.bagLedger(player.UserId),
-    playerGui = playerGui, revision = 0, statsRevision = 0, collectorVersion = "1.5",
+    playerGui = playerGui, revision = 0, statsRevision = 0, collectorVersion = "1.6",
 }
 if reuse then
     state.bag = previous.bag; Core.bagReindex(state.bag, state.catalog)
@@ -3182,6 +3182,37 @@ local function tradeLocalInventory()
     if not inventory then return nil, "Snapshot inventory tidak tersedia" end
     return Core.withProfileAbilities(inventory, data, player.UserId, state.catalog)
 end
+state.ReadTradeStock = function(requests)
+    local inventory, reason = tradeLocalInventory()
+    if not inventory then return nil, reason end
+    local stock = Core.captureGraph(inventory, CONFIG.MaxInventoryNodes)
+    local catalog = Core.captureGraph(state.catalog, CONFIG.MaxInventoryNodes)
+    local checkpoint = workCheckpoint()
+    local flat = Core.normalize(stock, catalog, {CollectRecords = true, Checkpoint = checkpoint})
+    if flat.truncated then return nil, "Pembacaan stok terpotong" end
+    local choices = Core.tradeChoices(stock, catalog, flat, checkpoint)
+    local byKey, unresolved, result = {}, {}, {}
+    for _, row in ipairs(choices) do byKey[row.key] = row end
+    for _, candidate in ipairs(flat.rows) do
+        checkpoint()
+        if not Core.itemReady(candidate) then
+            unresolved[candidate.category] = unresolved[candidate.category] or {}
+            unresolved[candidate.category][tostring(candidate.id)] = true
+        end
+    end
+    for _, item in ipairs(requests or {}) do
+        local row = byKey[item.key]
+        if row and not Core.itemReady(row) then return nil, "Informasi item tujuan belum selesai dipetakan" end
+        if not row then
+            local category, id = item.key:match("^([^%z]*)%z([^%z]*)")
+            if unresolved[category] and unresolved[category][id] or unresolved.Uncategorized and unresolved.Uncategorized[id] then return nil, "Informasi item tujuan belum selesai dipetakan" end
+        end
+        local qty = row and row.qty or 0
+        local eligible = row and row.trade and (row.trade.verifiedUnits + row.trade.unknownUnits) or 0
+        table.insert(result, {key = item.key, qty = qty, available = math.max(0, math.min(qty - (row and row.lockedQty or 0), eligible))})
+    end
+    return result
+end
 state.PrepareTrade = function(targetId, requests)
     local target = tonumber(targetId) and Players:GetPlayerByUserId(tonumber(targetId))
     if not target or target == player then return false, "Pilih player target yang masih berada di server" end
@@ -3341,6 +3372,8 @@ state.StopAutoTrade = function(reason)
     state.RestorePanel()
     if not ctx then return false end
     ctx.stopped = true; ctx.reason = reason or "Dihentikan pengguna"
+    state.lastTradeOutcome = ctx
+    if state.NotifyTradeFinished then state.NotifyTradeFinished(ctx, ctx.reason) end
     state.autoTrade = nil
     if not ctx.success then state.tradeRetryAfter = os.clock() + 12 end
     ctx.journal.recording = false; ctx.journal.finishedAt = os.time(); ctx.journal.stopReason = ctx.reason
@@ -3381,7 +3414,7 @@ state.StartAutoTrade = function(targetId, requests)
     journal.protocol = "Source-verified calls; Replion participant/offer checks; server completion plus local unit deltas"
     journal.completedBatches = 0
     local ctx = {target = target, plan = plan, batches = plan.batches, batchIndex = 1, finished = 0,
-        journal = journal, connections = {}, usedChannels = {}, deadline = os.clock() + 20}
+        journal = journal, sentByKey = {}, connections = {}, usedChannels = {}, deadline = os.clock() + 20}
     state.autoTrade = ctx; state.tradeJournal = journal; state.lastTradeFrame = nil; state.nextTradeFrame = 0
     state.HideForTradeRecording()
     spawnTask(function()
@@ -3421,7 +3454,7 @@ state.StartAutoTrade = function(targetId, requests)
             end
             for index, batch in ipairs(ctx.batches) do
                 ctx.batchIndex = index; ctx.phase = "between"; ctx.channel = nil; ctx.replion = nil
-                ctx.lastSummary = nil; ctx.completed = false; ctx.confirmRequested = false
+                ctx.lastSummary = nil; ctx.completed = false; ctx.confirmRequested = false; ctx.batchVerified = false; ctx.unconfirmedSlots = nil
                 ctx.sessionMissingAt = nil
                 autoCheck(ctx)
                 -- A finished session may briefly retain IsTrading while the game cleans up.
@@ -3489,6 +3522,7 @@ state.StartAutoTrade = function(targetId, requests)
                 if type(summary.lastModifiedTime) ~= "number"
                     or workspace:GetServerTimeNow() < summary.lastModifiedTime + ctx.adapter.data.ConfirmCountdownTime then error("Offer berubah sebelum konfirmasi", 0) end
                 ctx.phase = "confirmation"; ctx.confirmRequested = true; result.status = "confirmation"
+                ctx.unconfirmedSlots = slots
                 autoRpc(ctx, "ConfirmTrade")
                 autoWait(ctx, 120, "Menunggu target Confirm dan hasil server", function()
                     if ctx.completed then return true end
@@ -3513,6 +3547,10 @@ state.StartAutoTrade = function(targetId, requests)
                 end)
                 -- Exact unit deltas were already verified above; no historical delta log.
                 result.status = "completed"; result.completion = "serverConfirmedWithLocalUnitDelta"
+                ctx.batchVerified = true
+                for _, slot in ipairs(slots) do ctx.sentByKey[slot.key] = (ctx.sentByKey[slot.key] or 0) + 1 end
+                state.tradeStockRevision = (state.tradeStockRevision or 0) + 1
+                if state.Refresh then state.Refresh() end
                 ctx.finished = ctx.finished + 1; journal.completedBatches = ctx.finished; ctx.phase = "between"
                 if index < #ctx.batches then autoWait(ctx, 5, "Menyiapkan undangan berikutnya", function() return os.clock() + 0.1 >= ctx.deadline end) end
             end
@@ -3540,6 +3578,7 @@ refresh = function(force)
             state.readCache = {Checkpoint = checkpoint}
             local inventory, source, partial, readMetadata = readSource()
             if not inventory then status(source or "Inventori belum tersedia"); return end
+            local capturedTradeStockRevision = state.tradeStockRevision or 0
             local capture, capturedReplion
             if partial == false and state.replion and not state.replion.Destroyed and state.profileData then
                 capturedReplion = state.replion
@@ -3577,6 +3616,7 @@ refresh = function(force)
             state.completedRead = {inventory = inventory, flat = flat, generation = generation, catalog = readCatalog, isolated = capture ~= nil}
             local snapshot = table.clone(flat); snapshot.items = nil
             snapshot.isolated = capture ~= nil; snapshot.sourceGeneration = generation
+            snapshot.tradeStockRevision = capturedTradeStockRevision
             state.completedRead.snapshot = snapshot
             state.snapshotPhase = "Snapshot siap"
             partial = partial or snapshot.truncated
@@ -4203,6 +4243,96 @@ do
     end)
 end
 
+-- A website allocation uses the existing verified native trade engine.
+do
+    local job, cache, order = nil, {}, {}
+    local function amounts(values)
+        local result = {}
+        for key, quantity in pairs(values or {}) do table.insert(result, {key = key, quantity = quantity}) end
+        table.sort(result, function(a, b) return a.key < b.key end)
+        return result
+    end
+    local function progress(record, ctx, terminal, reason)
+        local unknown = {}
+        if terminal and ctx.confirmRequested and not ctx.batchVerified then
+            for _, slot in ipairs(ctx.unconfirmedSlots or {}) do unknown[slot.key] = (unknown[slot.key] or 0) + 1 end
+        end
+        record.report.sent = amounts(ctx.sentByKey)
+        record.report.proof = (ctx.finished or 0) > 0 and "serverConfirmedWithLocalUnitDelta" or nil
+        record.report.uncertain = amounts(unknown)
+        record.report.status = terminal and (next(unknown) and "uncertain" or ctx.success and "success" or "failed") or "processing"
+        record.report.message = reason or state.tradeMessage or "Mengirim item"
+        record.report.stockRevision = state.tradeStockRevision or 0
+    end
+    state.NotifyTradeFinished = function(ctx, reason)
+        if job and job.ctx == ctx then progress(job, ctx, true, reason); job.done = true; job.ctx = nil end
+    end
+    state.SetTradeTask = function(value)
+        if type(value) ~= "table" or type(value.id) ~= "string" then return end
+        if value.phase == "cancel" then
+            local record = cache[value.id]
+            if record and record.ctx and state.autoTrade == record.ctx then state.StopAutoTrade("Dihentikan dari website") end
+            if record and record.report and (not record.done or record.phase == "probe") then record.done = true; record.acknowledged = false; record.report.status = "stopped"; record.report.message = "Dihentikan pengguna" end
+            if record and record.report then job = record end
+            return
+        end
+        if cache[value.id] then if cache[value.id].report then job = cache[value.id] end; return end
+        if job and not job.done and job.phase == "send" then return end
+        if job and job.done then cache[job.id] = {done = true} end
+        local record = {id = value.id, phase = value.phase, target = value.target, items = value.items, report = {id = value.id, sent = {}, uncertain = {}, status = "processing", message = "Memeriksa stok aktual"}}
+        job = record; cache[value.id] = record; table.insert(order, value.id)
+        if #order > 64 then cache[table.remove(order, 1)] = nil end
+        if value.phase == "probe" then
+            spawnTask(function()
+                local ok, stocks, reason = pcall(state.ReadTradeStock, value.items)
+                if job ~= record or record.done then return end
+                record.report.status = ok and stocks and "ready" or "failed"
+                record.report.stocks = ok and stocks or nil
+                record.report.message = ok and stocks and "Stok aktual diperiksa" or tostring(ok and reason or stocks)
+                record.done = true
+            end)
+        elseif value.phase == "send" then record.report.message = "Menunggu " .. tostring(value.target) .. " masuk server"
+        else record.done = true; record.report.status = "failed"; record.report.message = "Perintah pengiriman tidak valid" end
+    end
+    state.TradeReport = function()
+        if job and job.ctx and not job.done then progress(job, job.ctx, false) end
+        return job and not job.acknowledged and job.report or nil
+    end
+    state.AcknowledgeTradeTask = function(id) if job and job.done and job.id == id then job.acknowledged = true end end
+    state.WebTradeActive = function() return job ~= nil and not job.done and job.phase == "send" end
+    state.WebTradeStatus = function() return job and job.report.message or nil end
+    spawnTask(function()
+        local nextLookup = 0
+        while state.alive do
+            if job and not job.done and job.phase == "send" then
+                local record = job
+                if record.ctx then
+                    if state.autoTrade ~= record.ctx then progress(record, record.ctx, true, state.tradeMessage); record.done = true; record.ctx = nil end
+                elseif os.clock() >= nextLookup then
+                    nextLookup = os.clock() + 10
+                    local target
+                    for _, candidate in ipairs(Players:GetPlayers()) do
+                        if candidate ~= player and type(record.target) == "string" and candidate.Name:lower() == record.target:lower() then target = candidate; break end
+                    end
+                    if target then
+                        if state.autoTrade or state.automation.enabled then
+                            record.done = true; record.report.status = "failed"; record.report.message = "Akun sedang menjalankan trade lain"
+                        else
+                            local accepted, reason = state.StartAutoTrade(target.UserId, record.items)
+                            if accepted then
+                                record.ctx = state.autoTrade; record.report.message = "Mengirim ke " .. target.Name
+                                -- task.spawn may complete a rejected invitation before StartAutoTrade returns.
+                                if not record.ctx and state.lastTradeOutcome then record.ctx = state.lastTradeOutcome; progress(record, record.ctx, true, state.tradeMessage); record.done = true; record.ctx = nil end
+                            else record.done = true; record.report.status = "failed"; record.report.message = tostring(reason) end
+                        end
+                    end
+                end
+            end
+            task.wait(job and not job.done and 1 or 10)
+        end
+    end)
+end
+
 -- Included by tools/build-rennstats.mjs; not a second collector entrypoint.
 do
     local config = type(env.RENNSTATS_CONFIG) == "table" and env.RENNSTATS_CONFIG or {}
@@ -4214,6 +4344,7 @@ do
         or (syn and syn.request) or (http and http.request) or (fluxus and fluxus.request)
     local session = HttpService:GenerateGUID(false)
     local upload, registered, lastVersion, lastFull, failures, initialComplete = nil, false, nil, 0, 0, false
+    local lastTradeStockRevision = 0
     local seenCommands, receipts, acknowledged = {}, {}, {}
     state.transport = {status = "Menunggu konfigurasi", sentBytes = 0, failures = 0}
     state.DataReady = function()
@@ -4230,6 +4361,7 @@ do
         if not state.alive then error("Collector ditutup", 0) end
         state.transport.httpStatus = nil
         payload.userId, payload.session = player.UserId, session
+        payload.tradeStockRevision = state.tradeStockRevision or 0
         local body = HttpService:JSONEncode(payload)
         local response = requestFn({Url = url .. "/api.php", Method = "POST", Timeout = timeout or 15,
             Headers = {["Content-Type"] = "application/json", ["Authorization"] = "Bearer " .. key}, Body = body})
@@ -4297,11 +4429,13 @@ do
             CONFIG.RefreshSeconds = math.clamp(tonumber(result.settings.readSeconds) or 60, 60, 120)
         end
         if result.automation then state.SetAutomation(result.automation) end
+        if result.tradeTaskAck then state.AcknowledgeTradeTask(result.tradeTaskAck) end
+        if result.tradeTask then state.SetTradeTask(result.tradeTask) end
     end
     local function metadata(snapshot)
         local ctx = state.autoTrade
         return {username = player.Name, displayName = player.DisplayName, placeId = game.PlaceId, gameId = game.GameId,
-            jobId = game.JobId, version = "rennstats/1.5", source = state.source, status = state.status,
+            jobId = game.JobId, version = "rennstats/1.6", source = state.source, status = state.status,
             paused = state.paused, lastError = state.lastError, catalogReady = state.catalogReady,
             playerStats = snapshot and snapshot.playerStats or state.playerStats,
             equipment = snapshot and snapshot.equipment or {},
@@ -4313,7 +4447,7 @@ do
     local function briefMetadata()
         local snapshot = state.snapshot
         return {username = player.Name, displayName = player.DisplayName, placeId = game.PlaceId,
-            gameId = game.GameId, jobId = game.JobId, version = "rennstats/1.5",
+            gameId = game.GameId, jobId = game.JobId, version = "rennstats/1.6",
             playerStats = snapshot and snapshot.playerStats or state.playerStats, equipment = snapshot and snapshot.equipment or {},
             progress = {phase = not snapshot and "Mengambil inventori" or state.DataReady() and "Siap" or "Memetakan informasi item",
                 complete = state.DataReady()}}
@@ -4342,11 +4476,13 @@ do
                 for _, value in pairs(receipts) do table.insert(pending, value) end
                 local ctx, policy = state.autoTrade, state.automation
                 local result = post({action = "control", receipts = pending, metadata = briefMetadata(), automationVersion = policy.finishedVersion,
-                    control = {paused = state.paused, enabled = policy.enabled, status = policy.status, target = policy.targets and policy.targets[policy.cursor],
+                    tradeReport = state.TradeReport(), tradeStockRevision = state.tradeStockRevision or 0,
+                    control = {paused = state.paused, enabled = policy.enabled or state.WebTradeActive(), status = state.WebTradeActive() and state.WebTradeStatus() or policy.status, target = policy.targets and policy.targets[policy.cursor],
                         version = policy.version, active = ctx ~= nil, message = state.tradeMessage, batch = ctx and ctx.batchIndex, finished = ctx and ctx.finished}})
                 consume(result)
                 local progressDue = not initialComplete and (lastVersion == nil or state.revision ~= lastVersion or state.DataReady())
-                if (upload or state.PublishReady() and (progressDue or os.clock() - lastFull >= 600)) and not state.paused then
+                local tradeDue = (state.tradeStockRevision or 0) > lastTradeStockRevision
+                if (upload or state.PublishReady() and (progressDue or tradeDue or os.clock() - lastFull >= 600)) and (not state.paused or tradeDue) then
                     if not upload then
                         if state.busy and not (state.snapshot and state.snapshot.isolated) then return end
                         local snapshot, revision, generation = state.snapshot, state.revision, state.inputGeneration or 0
@@ -4354,6 +4490,7 @@ do
                         local completed = state.completedRead
                         local isolated = snapshot.isolated and completed and completed.isolated and completed.snapshot == snapshot
                         if snapshot.isolated and not isolated then return end
+                        if (snapshot.tradeStockRevision or 0) < (state.tradeStockRevision or 0) then state.Refresh(); return end
                         local choices = state.TradeChoices(isolated and completed or nil)
                         -- Module discovery may yield; a report must come from one completed read.
                         if not isolated and (state.busy or state.snapshot ~= snapshot or state.revision ~= revision
@@ -4363,10 +4500,10 @@ do
                         if not isolated and (state.busy or state.snapshot ~= snapshot or state.revision ~= revision
                             or generation ~= (state.inputGeneration or 0) or not state.PublishReady()) then return end
                         local raw = HttpService:JSONEncode({inventory = inventory, choices = available, metadata = metadata(snapshot),
-                            capturedAt = snapshot.capturedAt or state.capturedAt, schema = "rennstats/v1"})
+                            capturedAt = snapshot.capturedAt or state.capturedAt, tradeStockRevision = snapshot.tradeStockRevision or 0, schema = "rennstats/v1"})
                         local ranges = Core.uploadRanges(raw, 196608)
                         upload = {id = HttpService:GenerateGUID(false), raw = raw, version = state.revision, part = 1,
-                            total = #ranges, ranges = ranges, complete = state.DataReady()}
+                            total = #ranges, ranges = ranges, complete = state.DataReady(), stockRevision = snapshot.tradeStockRevision or 0}
                     end
                     while state.alive and upload.part <= upload.total do
                         local part = upload.part
@@ -4378,6 +4515,7 @@ do
                     if state.alive then
                         consume(post({action = "commit", uploadId = upload.id, total = upload.total}))
                         lastVersion, lastFull = upload.version, os.clock()
+                        lastTradeStockRevision = upload.stockRevision or 0
                         initialComplete = initialComplete or upload.complete; upload = nil
                     end
                 end
