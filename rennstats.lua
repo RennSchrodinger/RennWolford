@@ -1,4 +1,4 @@
--- RennStats 1.4.1 | headless inventory collector and website-controlled trade.
+-- RennStats 1.5 | headless inventory collector and website-controlled trade.
 -- Backup: lua/backups/renn-inventory-before-rennstats-20261004.lua
 -- Set getgenv()._rennkey before executing. API: https://rennstats.rennhsg.my.id.
 local Core = (function()
@@ -1529,7 +1529,6 @@ local Core = (function()
         ability = {category = "Abilities", fields = {"EquippedAbility", "EquippedAbilities", "EquippedAbilityId", "ActiveAbility"},
             short = {"Ability", "Abilities"}},
         pet = {category = "Pets", fields = {"EquippedPetUUID", "EquippedPet", "EquippedPetId"}, short = {"Pet", "Pets"}},
-        potion = {category = "Potions", fields = {"EquippedPotions", "EquippedPotionUUID", "EquippedPotionId"}, short = {"Potion", "Potions"}},
     }
     local enchantFields = {"Enchantments", "Enchants", "Enchantment", "Enchant", "EnchantId", "EnchantmentId"}
     function M.enchantNames(value, catalog)
@@ -1719,8 +1718,8 @@ local Core = (function()
                     local resolved = resolve(item == true and index or item, config.category)
                     if resolved.status ~= "unknown" then table.insert(names, resolved.name); table.insert(resolvedItems, resolved) end
                 end
-                if key ~= "ability" and key ~= "potion" and #resolvedItems == 1 then slot = resolvedItems[1]
-                elseif key ~= "ability" and key ~= "potion" and #resolvedItems > 1 then slot = {name = "Belum terbaca (beberapa kandidat)", status = "unknown"}
+                if key ~= "ability" and #resolvedItems == 1 then slot = resolvedItems[1]
+                elseif key ~= "ability" and #resolvedItems > 1 then slot = {name = "Belum terbaca (beberapa kandidat)", status = "unknown"}
                 else
                     table.sort(names); slot = {name = #names > 0 and table.concat(names, ", ") or "Tidak ada",
                         status = #names > 0 and "known" or "none", items = resolvedItems}
@@ -1790,9 +1789,9 @@ local Core = (function()
         for _, config in pairs(equipmentSlots) do if table.find(config.fields, key) then return path end end
         return nil
     end
-    function M.isEquipmentPath(value) return equipmentPath(value) ~= nil end
+    function M.isEquipmentPath(value) return not M.isRemovedEquipmentPath(value) and equipmentPath(value) ~= nil end
     -- Only changes to fields used by the inventory/equipment projection cancel a read.
-    -- Countdown/coordinate values remain in the live profile and event mirror.
+    -- Coordinate annotations stay passive; removed equipment slots are ignored.
     local function sourcePath(value)
         local parts = {}
         if type(value) == "string" then
@@ -1807,11 +1806,12 @@ local Core = (function()
         return parts
     end
     function M.equipmentChangeRelevant(value, remote, update)
+        if M.isRemovedEquipmentPath and M.isRemovedEquipmentPath(value) then return false end
         local path = sourcePath(value)
         if not path then return true end -- Unknown notifications invalidate conservatively.
         if path[1] == "Data" or path[1] == "Profile" then table.remove(path, 1) end
         local function annotation(parts)
-            return parts[1] == "EquippedPotions" and tonumber(parts[2]) ~= nil and parts[3] == "Expires"
+            return M.isRemovedEquipmentPath and M.isRemovedEquipmentPath(parts)
                 or parts[1] == "Loadout" and (parts[2] == "LastCoordinate"
                     or parts[2] == "LastCharacterCoordinate" or parts[2] == "LastCharacterLocationName")
         end
@@ -1830,6 +1830,7 @@ local Core = (function()
     function M.sourceChangeRelevant(value, inventoryPaths, channel)
         local path = sourcePath(value)
         if not path or #path == 0 then return true end
+        if M.isRemovedEquipmentPath(path) then return false end
         if channel == "Inventory" then return true end
         for _, candidate in ipairs(inventoryPaths) do
             local matches = true
@@ -2100,7 +2101,7 @@ local Core = (function()
                 if serialized[1] ~= nil then
                     local owns, proof = M.profileScope(serialized[3], options.LocalUserId, serialized[2], serialized[4] == "All", options.PersonalChannels)
                     if owns then
-                        local data = M.copyData(serialized[3], options.MaxNodes)
+                        local data = M.copyData(M.profileProjection(serialized[3]), options.MaxNodes)
                         if data then store.profiles[serialized[1]] = {data = data, verified = true, scopeReason = proof}; store.excludedIds[serialized[1]] = nil; store.accepted = store.accepted + 1; store.revision = (store.revision or 0) + 1 end
                     else store.excludedIds[serialized[1]] = true; store.profiles[serialized[1]] = nil end
                 end
@@ -2112,6 +2113,7 @@ local Core = (function()
             store.profiles[args[1]] = nil; return
         end
         if args[1] == nil or store.excludedIds[args[1]] then return end
+        if M.isRemovedEquipmentPath(remote == "ArrayUpdate" and args[3] or args[2]) then return end
         local path = equipmentPath(remote == "ArrayUpdate" and args[3] or args[2])
         if not path then
             if remote == "Update" and args[3] == nil and type(args[2]) == "table" then
@@ -2125,13 +2127,13 @@ local Core = (function()
             if count >= 16 then return end
         end
         if remote == "Set" then
-            local value, err = M.copyData(args[3], options.MaxNodes); if err then return end
+            local value, err = M.copyData(M.equipmentEventValue(path, args[3]), options.MaxNodes); if err then return end
             if value == "\0" then value = false end
             setPath(profile.data, path, value)
         elseif remote == "Update" and type(args[3]) == "table" then
             local target = M.path(profile.data, path)
             if type(target) ~= "table" then target = {}; setPath(profile.data, path, target) end
-            local value = M.copyData(args[3], options.MaxNodes); if not value then return end
+            local value = M.copyData(M.equipmentEventValue(path, args[3]), options.MaxNodes); if not value then return end
             for key, child in pairs(value) do if child == "\0" then target[key] = false else target[key] = child end end
         elseif remote == "ArrayUpdate" then
             local array = M.path(profile.data, path)
@@ -2392,6 +2394,98 @@ local Core = (function()
         end
         return true
     end
+    -- Capture only stock, equipment/stat fields, and definitions. This copy never yields:
+    -- later normalization may yield safely while live Replion tables keep changing.
+    function M.captureGraph(value, limit)
+        if type(value) ~= "table" then return value end
+        local seen, pending, nodes = {}, {}, 0
+        local function clone(source, depth)
+            if seen[source] then return seen[source] end
+            if depth > 24 then error("Snapshot terlalu dalam", 0) end
+            local target = table.clone(source); seen[source] = target
+            table.insert(pending, {source, target, depth})
+            return target
+        end
+        local root = clone(value, 0)
+        while #pending > 0 do
+            local job = table.remove(pending)
+            for key, child in next, job[1] do
+                nodes += 1
+                if nodes > (limit or 200000) then error("Snapshot melebihi batas capture", 0) end
+                if type(child) == "table" then job[2][key] = clone(child, job[3] + 1) end
+            end
+        end
+        return root, nodes
+    end
+    function M.profileProjection(data)
+        if type(data) ~= "table" then return {} end
+        local function project(root)
+            local result = {}
+            for _, field in ipairs({"UserId", "OwnerUserId", "PlayerUserId", "Abilities", "EquippedItems", "EquippedId", "EquippedType",
+                "RodEnchantments", "FishingRodEnchantments", "EquippedRodEnchantments", "EquippedRodEnchants", "EquippedRodEnchant",
+                "Coin", "Coins", "CoinBalance", "TotalFishCaught", "FishCaught", "TotalCaught", "RarestFishOdds", "RarestFishChanceDenominator", "RarestFish"}) do
+                result[field] = root[field]
+            end
+            for _, config in pairs(equipmentSlots) do
+                for _, field in ipairs(config.fields) do result[field] = root[field] end
+            end
+            if type(root.Inventory) == "table" then
+                local equipment = {}
+                for _, config in pairs(equipmentSlots) do
+                    for _, field in ipairs(config.fields) do equipment[field] = root.Inventory[field] end
+                end
+                result.Inventory = equipment
+            end
+            for _, field in ipairs({"Equipment", "Equipped", "Loadout"}) do
+                if type(root[field]) == "table" then
+                    local container = table.clone(root[field])
+                    container.Potion = nil; container.Potions = nil; container.EquippedPotions = nil
+                    container.EquippedPotionUUID = nil; container.EquippedPotionId = nil
+                    container.LastCoordinate = nil; container.LastCharacterCoordinate = nil; container.LastCharacterLocationName = nil
+                    result[field] = container
+                end
+            end
+            for _, field in ipairs({"Statistics", "Stats", "Wallet", "Currencies", "Currency"}) do
+                if type(root[field]) == "table" then
+                    local fields = {}
+                    for _, key in ipairs({"Coins", "FishCaught", "TotalFishCaught", "RarestFishCaught", "RarestFishOdds", "RarestFishChanceDenominator", "RarestFish"}) do
+                        fields[key] = root[field][key]
+                    end
+                    result[field] = fields
+                end
+            end
+            return result
+        end
+        local result = project(data)
+        for _, field in ipairs({"Data", "Profile"}) do if type(data[field]) == "table" then result[field] = project(data[field]) end end
+        return result
+    end
+    function M.captureRead(inventory, profile, catalog, limit)
+        local stock, nodes = M.captureGraph(inventory, limit)
+        local projection = M.captureGraph(M.profileProjection(profile), limit)
+        local definitions = M.captureGraph(catalog, limit)
+        return {inventory = stock, profile = projection, catalog = definitions, nodes = nodes, isolated = true}
+    end
+    function M.equipmentEventValue(path, value)
+        local key = path[#path]
+        if type(value) == "table" and (key == "Equipment" or key == "Equipped" or key == "Loadout") then
+            return M.profileProjection({[key] = value})[key]
+        end
+        return value
+    end
+    function M.isRemovedEquipmentPath(value)
+        local path = sourcePath(value)
+        if not path then return false end
+        if path[1] == "Data" or path[1] == "Profile" then table.remove(path, 1) end
+        if path[1] == "Inventory" then
+            return path[2] == "EquippedPotions" or path[2] == "EquippedPotionUUID" or path[2] == "EquippedPotionId"
+        end
+        local container = path[1] == "Equipment" or path[1] == "Equipped" or path[1] == "Loadout"
+        if container then table.remove(path, 1) end
+        return path[1] == "EquippedPotions" or path[1] == "EquippedPotionUUID" or path[1] == "EquippedPotionId"
+            or container and (path[1] == "Potion" or path[1] == "Potions")
+    end
+
     return M
 end)()
 
@@ -2451,7 +2545,7 @@ local state = {
     observed = Core.eventStore(), equipmentObserved = Core.equipmentEvents(), remoteCount = 0, partial = true,
     cacheReaderProbes = {},
     bag = Core.bagLedger(player.UserId),
-    playerGui = playerGui, revision = 0, statsRevision = 0, collectorVersion = "1.4.1",
+    playerGui = playerGui, revision = 0, statsRevision = 0, collectorVersion = "1.5",
 }
 if reuse then
     state.bag = previous.bag; Core.bagReindex(state.bag, state.catalog)
@@ -2967,6 +3061,7 @@ local function readSource()
 end
 local function readEquipment(inventory, equipmentCache)
     local sources = {}; equipmentCache = equipmentCache or {}
+    local catalog = equipmentCache.catalog or state.catalog
     if state.profileData then table.insert(sources, {data = state.profileData, name = "Replion profile"}) end
     if state.equipmentProfileData then table.insert(sources, {data = state.equipmentProfileData, name = "Replion equipment profile"}) end
     local eventProfile = state.profileId and state.equipmentObserved.profiles[state.profileId]
@@ -2989,7 +3084,7 @@ local function readEquipment(inventory, equipmentCache)
                 record.Id = record.ItemId or record.Id
                 record.UUID = record.UUID or record.ItemUUID or record.UniqueId
                 record.Name = record.ItemName or tool.Name
-                local entry = Core.lookup(state.catalog, record.Id, record.Name, "Fishing Rods")
+                local entry = Core.lookup(catalog, record.Id, record.Name, "Fishing Rods")
                 local actualType = record.ItemType or record.Type
                 if entry or (actualType and Core.category(actualType) == "Fishing Rods") then
                     table.insert(held, record)
@@ -2998,17 +3093,17 @@ local function readEquipment(inventory, equipmentCache)
         end
     end
     if #held == 1 then table.insert(sources, {data = {EquippedRod = held[1]}, name = "Local Character.Tool"}) end
-    local equipment = Core.equipment({}, inventory, state.catalog, player.UserId, equipmentCache)
+    local equipment = Core.equipment({}, inventory, catalog, player.UserId, equipmentCache)
     local stats = Core.playerStats({}, player.UserId, false)
     for _, source in ipairs(sources) do
-        local incoming = Core.equipment(source.data, inventory, state.catalog, player.UserId, equipmentCache)
+        local incoming = Core.equipment(source.data, inventory, catalog, player.UserId, equipmentCache)
         local incomingStats = Core.playerStats(source.data, player.UserId, false)
         for _, key in ipairs({"coins", "caught", "rarestFish"}) do
             if stats[key].status == "unknown" and incomingStats[key].status == "known" then
                 stats[key] = incomingStats[key]; stats[key].source = source.name .. " / " .. incomingStats[key].source
             end
         end
-        for _, key in ipairs({"rod", "bait", "ability", "pet", "potion"}) do
+        for _, key in ipairs({"rod", "bait", "ability", "pet"}) do
             if equipment[key].status == "unknown" and incoming[key].status ~= "unknown" then
                 equipment[key] = incoming[key]; equipment[key].source = source.name .. " / " .. incoming[key].source
             elseif key == "rod" and incoming.rod.enchantKnown then
@@ -3048,7 +3143,6 @@ local function readEquipment(inventory, equipmentCache)
         .. "\nEnchant 2: " .. equipment.rod.enchant2 .. "\nEquip Bait: " .. equipment.bait.name .. " | " .. equipment.bait.source
         .. "\nEquip Ability: " .. equipment.ability.name .. " | " .. equipment.ability.source
         .. "\nEquip Pet: " .. equipment.pet.name .. " | " .. equipment.pet.source
-        .. "\nEquip Potions: " .. equipment.potion.name .. " | " .. equipment.potion.source
         .. "\nEquipment events: " .. tostring(state.equipmentObserved.accepted)
         .. "\nScope equip event: " .. tostring(eventProfile and (eventProfile.scopeReason or "ID sesuai channel inventory yang teramati")
             or (state.profileData and "Equip diperiksa langsung dari profile snapshot aktif; ID event belum terhubung")
@@ -3060,11 +3154,12 @@ local function readEquipment(inventory, equipmentCache)
     end
 end
 state.tradeMessage = "Kontrol trade tersedia melalui website."
-state.TradeChoices = function()
-    local read = state.completedRead
-    local prepared = not state.busy and read and read.inventory == state.currentInventory
-        and read.catalog == state.catalog and read.generation == (state.inputGeneration or 0) and read.flat or nil
-    local choices = Core.tradeChoices(state.currentInventory or {}, state.catalog, prepared, workCheckpoint())
+state.TradeChoices = function(completed)
+    local read = completed or state.completedRead
+    local inventory = read and read.isolated and read.inventory or state.currentInventory
+    local prepared = read and read.inventory == inventory
+        and (read.isolated or not state.busy and read.catalog == state.catalog and read.generation == (state.inputGeneration or 0)) and read.flat or nil
+    local choices = Core.tradeChoices(inventory or {}, read and read.isolated and read.catalog or state.catalog, prepared, workCheckpoint())
     local rap
     for _, entry in ipairs(state.clients) do
         rap = Core.clientLookup(entry.client, "RAP")
@@ -3445,9 +3540,22 @@ refresh = function(force)
             state.readCache = {Checkpoint = checkpoint}
             local inventory, source, partial, readMetadata = readSource()
             if not inventory then status(source or "Inventori belum tersedia"); return end
+            local capture, capturedReplion
+            if partial == false and state.replion and not state.replion.Destroyed and state.profileData then
+                capturedReplion = state.replion
+                local started = os.clock()
+                capture = Core.captureRead(inventory, state.profileData, state.catalog, CONFIG.MaxInventoryNodes)
+                state.captureMs = (os.clock() - started) * 1000; state.captureNodes = capture.nodes
+                inventory = capture.inventory; state.profileData = capture.profile
+                state.readCache.catalog = capture.catalog; generation = state.inputGeneration or 0
+                state.readCache.abilityViews = {[inventory] = {[capture.profile] = inventory}}
+                readMetadata = table.clone(readMetadata or {}); readMetadata.capturedAt = os.time()
+                state.snapshotPhase = "Normalize snapshot"
+            end
+            local readCatalog = capture and capture.catalog or state.catalog
             -- Normalization copies owned metadata into the prepared records.
             -- Discard the staged result if the source changes across a yield.
-            local flat = Core.normalize(inventory, state.catalog, {
+            local flat = Core.normalize(inventory, readCatalog, {
                 MaxNodes = CONFIG.MaxInventoryNodes, CollectRecords = true, CollectDefinitions = true, Checkpoint = checkpoint,
             })
             state.readCache[inventory] = flat
@@ -3455,16 +3563,22 @@ refresh = function(force)
             local nextBag
             if state.readCache.replaceBag and not flat.truncated then
                 nextBag = table.clone(state.bag)
-                Core.bagReplace(nextBag, inventory, state.catalog, "Inventory", flat, checkpoint)
+                Core.bagReplace(nextBag, inventory, readCatalog, "Inventory", flat, checkpoint)
             end
             if not state.alive then return end
-            if generation ~= (state.inputGeneration or 0) then
+            if capture and (state.replion ~= capturedReplion or capturedReplion.Destroyed) then
+                state.pendingRefresh = true; return
+            end
+            if not capture and generation ~= (state.inputGeneration or 0) then
                 state.discardedReads = (state.discardedReads or 0) + 1; state.pendingRefresh = true; return
             end
-            if nextBag then state.bag = nextBag end
+            if nextBag and generation == (state.inputGeneration or 0) then state.bag = nextBag end
             state.currentInventory = inventory
-            state.completedRead = {inventory = inventory, flat = flat, generation = generation, catalog = state.catalog}
+            state.completedRead = {inventory = inventory, flat = flat, generation = generation, catalog = readCatalog, isolated = capture ~= nil}
             local snapshot = table.clone(flat); snapshot.items = nil
+            snapshot.isolated = capture ~= nil; snapshot.sourceGeneration = generation
+            state.completedRead.snapshot = snapshot
+            state.snapshotPhase = "Snapshot siap"
             partial = partial or snapshot.truncated
             snapshot.partial = partial
             snapshot.catalogReady = state.catalogReady
@@ -4187,7 +4301,7 @@ do
     local function metadata(snapshot)
         local ctx = state.autoTrade
         return {username = player.Name, displayName = player.DisplayName, placeId = game.PlaceId, gameId = game.GameId,
-            jobId = game.JobId, version = "rennstats/1.4.1", source = state.source, status = state.status,
+            jobId = game.JobId, version = "rennstats/1.5", source = state.source, status = state.status,
             paused = state.paused, lastError = state.lastError, catalogReady = state.catalogReady,
             playerStats = snapshot and snapshot.playerStats or state.playerStats,
             equipment = snapshot and snapshot.equipment or {},
@@ -4199,7 +4313,7 @@ do
     local function briefMetadata()
         local snapshot = state.snapshot
         return {username = player.Name, displayName = player.DisplayName, placeId = game.PlaceId,
-            gameId = game.GameId, jobId = game.JobId, version = "rennstats/1.4.1",
+            gameId = game.GameId, jobId = game.JobId, version = "rennstats/1.5",
             playerStats = snapshot and snapshot.playerStats or state.playerStats, equipment = snapshot and snapshot.equipment or {},
             progress = {phase = not snapshot and "Mengambil inventori" or state.DataReady() and "Siap" or "Memetakan informasi item",
                 complete = state.DataReady()}}
@@ -4234,17 +4348,20 @@ do
                 local progressDue = not initialComplete and (lastVersion == nil or state.revision ~= lastVersion or state.DataReady())
                 if (upload or state.PublishReady() and (progressDue or os.clock() - lastFull >= 600)) and not state.paused then
                     if not upload then
-                        if state.busy then return end
+                        if state.busy and not (state.snapshot and state.snapshot.isolated) then return end
                         local snapshot, revision, generation = state.snapshot, state.revision, state.inputGeneration or 0
-                        if state.completedRead and state.completedRead.generation ~= generation then state.Refresh(); return end
-                        local choices = state.TradeChoices()
+                        if state.completedRead and not snapshot.isolated and state.completedRead.generation ~= generation then state.Refresh(); return end
+                        local completed = state.completedRead
+                        local isolated = snapshot.isolated and completed and completed.isolated and completed.snapshot == snapshot
+                        if snapshot.isolated and not isolated then return end
+                        local choices = state.TradeChoices(isolated and completed or nil)
                         -- Module discovery may yield; a report must come from one completed read.
-                        if state.busy or state.snapshot ~= snapshot or state.revision ~= revision
-                            or generation ~= (state.inputGeneration or 0) or not state.PublishReady() then return end
+                        if not isolated and (state.busy or state.snapshot ~= snapshot or state.revision ~= revision
+                            or generation ~= (state.inputGeneration or 0) or not state.PublishReady()) then return end
                         local inventory, available = Core.publishInventory(snapshot, choices, Core.workCheckpoint(task.wait, os.clock, 0.002))
                         if not inventory then return end
-                        if state.busy or state.snapshot ~= snapshot or state.revision ~= revision
-                            or generation ~= (state.inputGeneration or 0) or not state.PublishReady() then return end
+                        if not isolated and (state.busy or state.snapshot ~= snapshot or state.revision ~= revision
+                            or generation ~= (state.inputGeneration or 0) or not state.PublishReady()) then return end
                         local raw = HttpService:JSONEncode({inventory = inventory, choices = available, metadata = metadata(snapshot),
                             capturedAt = snapshot.capturedAt or state.capturedAt, schema = "rennstats/v1"})
                         local ranges = Core.uploadRanges(raw, 196608)
