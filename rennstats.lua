@@ -1,4 +1,4 @@
--- RennStats 1.8 | incremental inventory collector and website-controlled trade.
+-- RennStats 1.8.1 | incremental inventory collector and website-controlled trade.
 -- Backup: lua/backups/renn-inventory-before-rennstats-20261004.lua
 -- Set getgenv()._rennkey before executing. API: https://rennstats.rennhsg.my.id.
 local Core = (function()
@@ -2822,7 +2822,7 @@ local state = {
     observed = Core.eventStore(), equipmentObserved = Core.equipmentEvents(), remoteCount = 0, partial = true,
     cacheReaderProbes = {},
     bag = Core.bagLedger(player.UserId),
-    playerGui = playerGui, revision = 0, statsRevision = 0, collectorVersion = "1.8",
+    playerGui = playerGui, revision = 0, statsRevision = 0, collectorVersion = "1.8.1",
 }
 if reuse then
     state.bag = previous.bag; Core.bagReindex(state.bag, state.catalog)
@@ -4605,6 +4605,12 @@ do
         local record = {id = value.id, phase = value.phase, target = value.target, items = value.items, report = {id = value.id, sent = {}, uncertain = {}, status = "processing", message = "Memeriksa stok aktual"}}
         job = record; cache[value.id] = record; table.insert(order, value.id)
         if #order > 64 then cache[table.remove(order, 1)] = nil end
+        if (value.phase == "probe" or value.phase == "send") and type(value.target) == "string"
+            and type(player.Name) == "string" and value.target:lower() == player.Name:lower() then
+            record.done = true; record.report.status = "skipped"
+            record.report.message = "Dilewati: akun ini adalah penerima; tidak mengirim ke diri sendiri"
+            return
+        end
         if value.phase == "probe" then
             spawnTask(function()
                 local ok, stocks, reason = pcall(state.ReadTradeStock, value.items)
@@ -4763,7 +4769,7 @@ do
     local function metadata(snapshot)
         local ctx = state.autoTrade
         return {username = player.Name, displayName = player.DisplayName, placeId = game.PlaceId, gameId = game.GameId,
-            jobId = game.JobId, version = "rennstats/1.8", source = state.source, status = state.status,
+            jobId = game.JobId, version = "rennstats/1.8.1", source = state.source, status = state.status,
             paused = state.paused, lastError = state.lastError, catalogReady = state.catalogReady,
             playerStats = snapshot and snapshot.playerStats or state.playerStats,
             equipment = snapshot and snapshot.equipment or {},
@@ -4775,7 +4781,7 @@ do
     local function briefMetadata()
         local snapshot = state.snapshot
         return {username = player.Name, displayName = player.DisplayName, placeId = game.PlaceId,
-            gameId = game.GameId, jobId = game.JobId, version = "rennstats/1.8",
+            gameId = game.GameId, jobId = game.JobId, version = "rennstats/1.8.1",
             playerStats = snapshot and snapshot.playerStats or state.playerStats, equipment = snapshot and snapshot.equipment or {},
             progress = {phase = not snapshot and "Mengambil inventori" or state.DataReady() and "Siap" or "Memetakan informasi item",
                 complete = state.DataReady()}}
