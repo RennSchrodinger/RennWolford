@@ -1,4 +1,4 @@
--- RennStats 1.8.1 | incremental inventory collector and website-controlled trade.
+-- RennStats 1.9 | incremental inventory collector and website-controlled trade.
 -- Backup: lua/backups/renn-inventory-before-rennstats-20261004.lua
 -- Set getgenv()._rennkey before executing. API: https://rennstats.rennhsg.my.id.
 local Core = (function()
@@ -2094,6 +2094,96 @@ local Core = (function()
         return result, available
     end
 
+    function M.fishingObserve(history, profile, flat, sample, checkpoint)
+        history=history or {caught=0,classified=0,secret=0,forgotten=0,secretGapSum=0,secretGapCount=0,forgottenGapSum=0,forgottenGapCount=0}
+        local root=profile or {}
+        for _,key in ipairs({"Data","Profile"}) do if type(root[key])=="table" and type(root[key].Statistics)=="table" then root=root[key];break end end
+        local analytics=type(root.Analytics)=="table" and root.Analytics or {}
+        local caught=sample.caught
+        local function number(value) return type(value)=="number" and value==value and value>=0 and value<1e15 and value%1==0 and value or nil end
+        caught=number(caught)
+        if not caught then history.previous=nil;return history,nil end
+        local current={caught=caught,source=sample.source,at=sample.at,complete=sample.complete,trading=sample.trading}
+        local prior=history.previous
+        for _,tier in ipairs({"secret","forgotten"}) do
+            local suffix=tier=="secret" and "Secret" or "Forgotten"
+            current[tier.."At"]=number(analytics["Last"..suffix.."Timestamp"])
+            current[tier.."Since"]=number(analytics["FishSinceLast"..suffix])
+        end
+        local count=prior and caught-prior.caught or 0
+        -- Reuse an inventory identity when no item data changed. Only normalized
+        -- personal fish records participate; no additional source discovery.
+        if prior and (prior.items==flat.items or sample.inventory~=nil and prior.inventory==sample.inventory and prior.catalog==sample.catalog) then current.stock=prior.stock else
+            current.stock={}
+            for _,record in ipairs(flat.items or {}) do
+                if checkpoint then checkpoint() end
+                if record.Type=="Fish" and M.uuid(record.UUID) then
+                    local rarity=tostring(record.Rarity):lower();local tier=(rarity=="secret" or rarity=="tier 7") and "secret" or (rarity=="forgotten" or rarity=="tier 8") and "forgotten" or nil
+                    current.stock[record.UUID]={qty=record.Quantity,tier=tier}
+                end
+            end
+        end
+        current.items=flat.items
+        current.inventory=sample.inventory;current.catalog=sample.catalog
+        local continuous=prior and prior.source==sample.source and count>=0 and sample.at>=prior.at and sample.at-prior.at<=300
+        if not continuous then history.secretLastIndex=nil;history.forgottenLastIndex=nil end
+        if continuous and count>0 then
+            history.caught+=count
+            local added,removed,rare=0,false,{secret=0,forgotten=0}
+            for uuid,entry in pairs(current.stock) do
+                if checkpoint then checkpoint() end
+                local old=prior.stock[uuid];local delta=entry.qty-(old and old.qty or 0)
+                if delta>0 then added+=delta;if entry.tier then rare[entry.tier]+=delta end end
+                if delta<0 then removed=true end
+            end
+            for uuid in pairs(prior.stock) do if not current.stock[uuid] then removed=true end end
+            local confirmed=sample.complete and prior.complete and not sample.trading and not prior.trading and not removed and added==count
+            for _,tier in ipairs({"secret","forgotten"}) do
+                if rare[tier]>0 then
+                    local time=current[tier.."At"];local old=prior[tier.."At"]
+                    local since=current[tier.."Since"];local oldSince=prior[tier.."Since"]
+                    if not ((time and old and time>old) or (since and oldSince and since~=oldSince and since<oldSince+count)) then confirmed=false end
+                end
+            end
+            if confirmed then history.classified+=count;history.secret+=rare.secret;history.forgotten+=rare.forgotten end
+            for _,tier in ipairs({"secret","forgotten"}) do
+                local since=current[tier.."Since"];local oldSince=prior[tier.."Since"]
+                local at=current[tier.."At"];local oldAt=prior[tier.."At"]
+                local updated=(at and oldAt and at>oldAt) or (since and oldSince and since~=oldSince and since<oldSince+count)
+                local lastIndex=since and caught-since
+                if updated and lastIndex and lastIndex>=prior.caught and lastIndex<=caught then
+                    local previous=history[tier.."LastIndex"] or (oldSince and prior.caught-oldSince)
+                    -- A batch with several rare fish cannot reveal each intermediate gap.
+                    if confirmed and rare[tier]==1 and previous and lastIndex>previous then
+                        history[tier.."GapSum"]+=lastIndex-previous;history[tier.."GapCount"]+=1
+                    end
+                    history[tier.."LastIndex"]=lastIndex
+                end
+            end
+        end
+        history.previous=current
+        local report={runId=sample.runId,at=sample.at,totalCaught=caught}
+        for _,key in ipairs({"caught","classified","secret","forgotten","secretGapSum","secretGapCount","forgottenGapSum","forgottenGapCount"}) do report[key]=history[key] end
+        for _,tier in ipairs({"secret","forgotten"}) do report[tier.."At"]=current[tier.."At"];report[tier.."Since"]=current[tier.."Since"] end
+        local unchanged=history.lastReport~=nil
+        if unchanged then for key,value in pairs(report) do if key~="at" and history.lastReport[key]~=value then unchanged=false;break end end end
+        if unchanged then for key in pairs(history.lastReport) do if key~="at" and report[key]==nil then unchanged=false;break end end end
+        if unchanged and sample.at-history.lastReport.at<10800 then return history,history.lastReport end
+        history.lastReport=report;return history,report
+    end
+    function M.tradeItemKey(row) return row.category .. "\0" .. tostring(row.id) .. "\0" .. row.name end
+    function M.tradeRequestMatches(request, key)
+        if request.byItem then return key:match("^([^%z]*%z[^%z]*%z[^%z]*)") == request.key end
+        return request.key == key
+    end
+    function M.tradeReportedAmounts(values, requests)
+        local totals={}
+        for key,quantity in pairs(values or {}) do
+            for _,request in ipairs(requests or {}) do if M.tradeRequestMatches(request,key) then totals[request.key]=(totals[request.key] or 0)+quantity;break end end
+        end
+        local result={};for key,quantity in pairs(totals) do table.insert(result,{key=key,quantity=quantity}) end
+        table.sort(result,function(a,b)return a.key<b.key end);return result
+    end
     function M.tradePlan(inventory, catalog, requests, context)
         context = context or {}
         local localId, targetId = tonumber(context.localUserId), tonumber(context.targetUserId)
@@ -2115,7 +2205,7 @@ local Core = (function()
                 if row then
                     groups[row.key] = groups[row.key] or {}
                     table.insert(groups[row.key], {uuid = uuid, id = record.Id, name = M.displayItemName(row),
-                        category = record.Type, mutation = row.mutation, available = qty, sourceQuantity = qty, trade = eligibility})
+                        category = record.Type, key=row.key, mutation = row.mutation, available = qty, sourceQuantity = qty, trade = eligibility})
                 end
             end
         end
@@ -2125,16 +2215,22 @@ local Core = (function()
             status = "planned", requests = M.copyData(requests, 5000)}
         for _, request in ipairs(requests) do
             if type(request) ~= "table" or type(request.key) ~= "string" then return nil, "Pilihan item tidak valid" end
-            if context.itemCatalogReady == true and not M.itemReady(canonicalRows[request.key]) then return nil, "Informasi item pilihan belum siap" end
+            local sources={}
+            for key,group in pairs(groups) do if M.tradeRequestMatches(request,key) then
+                if context.itemCatalogReady == true and not M.itemReady(canonicalRows[key]) then return nil, "Informasi item pilihan belum siap" end
+                for _,source in ipairs(group) do table.insert(sources,source) end
+            end end
+            if not request.byItem and context.itemCatalogReady == true and not M.itemReady(canonicalRows[request.key]) then return nil, "Informasi item pilihan belum siap" end
+            table.sort(sources,function(a,b)return a.key==b.key and a.uuid<b.uuid or a.key<b.key end)
             local wanted = tonumber(request.quantity)
             if not wanted or wanted <= 0 or wanted % 1 ~= 0 or wanted > 1000 or plan.total + wanted > 1000 then return nil, "Jumlah harus bilangan bulat 1–1000; maksimal 1000 unit per rencana" end
             local remaining = wanted
-            for _, source in ipairs(groups[request.key] or {}) do
+            for _, source in ipairs(sources) do
                 local take = math.min(remaining, source.available)
                 for _ = 1, take do
                     local sourceIndex = source.sourceQuantity - source.available + 1
                     table.insert(plan.units, {sourceUUID = source.uuid, id = source.id, name = source.name, category = source.category,
-                        key = request.key, mutation = source.mutation, quantity = 1, sourceQuantity = source.sourceQuantity, sourceUnitIndex = sourceIndex,
+                        key = source.key, mutation = source.mutation, quantity = 1, sourceQuantity = source.sourceQuantity, sourceUnitIndex = sourceIndex,
                         tradeStatus = source.trade.status, rap = source.trade.rap, tradeSource = source.trade.source,
                         requiresUnitSelection = source.sourceQuantity > 1})
                     source.available = source.available - 1
@@ -2691,6 +2787,10 @@ local Core = (function()
                     result[field] = fields
                 end
             end
+            if type(root.Analytics)=="table" then
+                result.Analytics={}
+                for _,key in ipairs({"LastSecretTimestamp","LastForgottenTimestamp","FishSinceLastSecret","FishSinceLastForgotten"}) do result.Analytics[key]=root.Analytics[key] end
+            end
             return result
         end
         local result = project(data)
@@ -2822,7 +2922,7 @@ local state = {
     observed = Core.eventStore(), equipmentObserved = Core.equipmentEvents(), remoteCount = 0, partial = true,
     cacheReaderProbes = {},
     bag = Core.bagLedger(player.UserId),
-    playerGui = playerGui, revision = 0, statsRevision = 0, collectorVersion = "1.8.1",
+    playerGui = playerGui, revision = 0, statsRevision = 0, collectorVersion = "1.9",
 }
 if reuse then
     state.bag = previous.bag; Core.bagReindex(state.bag, state.catalog)
@@ -3486,6 +3586,17 @@ state.ReadTradeStock = function(requests)
     end
     for _, item in ipairs(requests or {}) do
         local row = byKey[item.key]
+        if item.byItem then
+            local category,id=item.key:match("^([^%z]*)%z([^%z]*)")
+            if (unresolved[category] and unresolved[category][id]) or (unresolved.Uncategorized and unresolved.Uncategorized[id]) then return nil,"Informasi item tujuan belum selesai dipetakan" end
+            row=nil
+            for _,candidate in ipairs(choices) do if Core.tradeRequestMatches(item,candidate.key) then
+                if not Core.itemReady(candidate) then return nil,"Informasi item tujuan belum selesai dipetakan" end
+                if not row then row={qty=0,lockedQty=0,trade={verifiedUnits=0,unknownUnits=0},resolved=true,name=candidate.name,icon=candidate.icon,key=item.key} end
+                row.qty+=candidate.qty;row.lockedQty+=candidate.lockedQty or 0
+                row.trade.verifiedUnits+=candidate.trade.verifiedUnits;row.trade.unknownUnits+=candidate.trade.unknownUnits
+            end end
+        end
         if row and not Core.itemReady(row) then return nil, "Informasi item tujuan belum selesai dipetakan" end
         if not row then
             local category, id = item.key:match("^([^%z]*)%z([^%z]*)")
@@ -3561,24 +3672,27 @@ local function tradeAdapter()
     return adapter
 end
 state.ResolveTradeAdapter = tradeAdapter
-local function ownedTradeRecord(inventory, uuid)
-    local found, collection, visited
-    visited = 0
+local function ownedTradeRecords(inventory, slots, checkpoint)
+    local wanted,found,visited={},{},0
+    for _,slot in ipairs(slots) do wanted[slot.sourceUUID]=true end
     for kind, records in pairs(inventory) do
         if type(records) == "table" then
             for _, record in pairs(records) do
+                if checkpoint then checkpoint() end
                 visited = visited + 1
                 if visited > CONFIG.MaxInventoryNodes then error("Snapshot terlalu besar untuk memeriksa UUID", 0) end
-                if type(record) == "table" and Core.uuid(record.UUID) == uuid then
-                    if found then error("UUID inventory berulang", 0) end
-                    found, collection = record, kind
+                local uuid=type(record)=="table" and Core.uuid(record.UUID)
+                if uuid and wanted[uuid] then
+                    if found[uuid] then error("UUID inventory berulang", 0) end
+                    found[uuid]={record=record,collection=kind}
                 end
             end
         end
     end
-    if not found then error("UUID pilihan sudah tidak dimiliki: " .. uuid, 0) end
-    return found, collection
+    for uuid in pairs(wanted) do if not found[uuid] then error("UUID pilihan sudah tidak dimiliki: " .. uuid, 0) end end
+    return found
 end
+state.TradeOwnedRecords=ownedTradeRecords
 local function autoSummary(ctx)
     local replion = ctx.replion and not ctx.replion.Destroyed and ctx.replion or (ctx.channel and tradeReplion(ctx.channel))
     if not replion or replion.Destroyed then return nil end
@@ -3753,9 +3867,10 @@ state.StartAutoTrade = function(targetId, requests)
                 local inventory, invError = tradeLocalInventory()
                 if not inventory then error(invError, 0) end
                 local before = Core.tradeInventoryQuantities(inventory, state.catalog, batch.slots)
+                local owned=ownedTradeRecords(inventory,batch.slots,workCheckpoint())
                 local slots = {}
                 for _, unit in ipairs(batch.slots) do
-                    local record, collection = ownedTradeRecord(inventory, unit.sourceUUID)
+                    local record, collection = owned[unit.sourceUUID].record,owned[unit.sourceUUID].collection
                     local definition = ctx.adapter.utility.GetItemDataFromItemType(collection, record.Id)
                     if not definition or not definition.Data or tostring(definition.Data.Id) ~= tostring(unit.id)
                         or Core.category(definition.Data.Type) ~= unit.category or ctx.adapter.data.FollowTradeRules(definition, record) ~= true
@@ -3947,6 +4062,11 @@ refresh = function(force)
             snapshot.equipment = {}
             snapshot.playerStats = {}
             for _, key in ipairs({"coins", "caught", "rarestFish"}) do snapshot.playerStats[key] = state.playerStats[key] end
+            if state.fishingRunId then
+                state.fishingHistory,snapshot.fishing=Core.fishingObserve(state.fishingHistory,state.profileData,flat,
+                    {runId=state.fishingRunId,source=state.replion or source,inventory=capture and inventory or nil,catalog=readCatalog,at=os.time(),caught=snapshot.playerStats.caught and snapshot.playerStats.caught.value,
+                        complete=not partial and not flat.truncated and flat.unresolved==0,trading=state.autoTrade~=nil or player:GetAttribute("IsTrading")==true},checkpoint)
+            end
             for key, slot in pairs(state.equipment) do snapshot.equipment[key] = {name = slot.name, id = slot.id, uuid = slot.uuid,
                 status = slot.status, source = slot.source, enchants = slot.enchants, enchantKnown = slot.enchantKnown,
                 enchant1 = slot.enchant1, enchant2 = slot.enchant2, enchant1Known = slot.enchant1Known, enchant2Known = slot.enchant2Known}
@@ -3969,6 +4089,7 @@ refresh = function(force)
             end
             local signature = source .. "\n" .. rowSignature(snapshot.rows)
             local changed = signature ~= state.signature or not previousFlat or not Core.dataEqual(previousFlat.items,flat.items,checkpoint)
+                or not Core.dataEqual(state.snapshot and state.snapshot.fishing,snapshot.fishing,checkpoint)
             state.signature = signature; state.baselineSource = source; state.lastTruncated = snapshot.truncated
             state.baselineCatalog = state.catalog.count
             if changed or state.partial ~= partial then state.revision = state.revision + 1 end
@@ -4442,11 +4563,24 @@ local function startInventoryObserver()
     if folder then
         for _, instance in ipairs(folder:GetChildren()) do hook(instance) end
     else
-        local stack, checkpoint = {ReplicatedStorage}, workCheckpoint()
-        while #stack > 0 and state.alive do
-            local instance = table.remove(stack); hook(instance); checkpoint()
-            for _, child in ipairs(instance:GetChildren()) do table.insert(stack, child) end
-        end
+        -- Preserve alternate layouts only as a slow recovery cursor. Discovery
+        -- never walks the whole tree synchronously during initial execution.
+        spawnTask(function()
+            local stack,checkpoint={ReplicatedStorage},workCheckpoint()
+            while #stack>0 and state.alive and not state.remoteFolder do
+                if not state.paused then
+                    local foundModule=findReplionModule();local exact=foundModule and foundModule:FindFirstChild("Remotes")
+                    if exact then for _,remote in ipairs(exact:GetChildren()) do hook(remote) end end
+                    local budget=0
+                    while #stack>0 and budget<128 and state.alive and not state.remoteFolder do
+                        local node=table.remove(stack);hook(node);checkpoint();budget+=1
+                        for _,child in ipairs(node:GetChildren()) do table.insert(stack,child) end
+                    end
+                end
+                if #stack>0 and not state.remoteFolder then task.wait(10) end
+            end
+            if state.remoteFolder then for _,remote in ipairs(state.remoteFolder:GetChildren()) do hook(remote) end end
+        end)
     end
 end
 discoverClient = function()
@@ -4580,9 +4714,9 @@ do
         if terminal and ctx.confirmRequested and not ctx.batchVerified then
             for _, slot in ipairs(ctx.unconfirmedSlots or {}) do unknown[slot.key] = (unknown[slot.key] or 0) + 1 end
         end
-        record.report.sent = amounts(ctx.sentByKey)
+        record.report.sent = Core.tradeReportedAmounts(ctx.sentByKey,record.items)
         record.report.proof = (ctx.finished or 0) > 0 and "serverConfirmedWithLocalUnitDelta" or nil
-        record.report.uncertain = amounts(unknown)
+        record.report.uncertain = Core.tradeReportedAmounts(unknown,record.items)
         record.report.status = terminal and (next(unknown) and "uncertain" or ctx.success and "success" or "failed") or "processing"
         record.report.message = reason or state.tradeMessage or "Mengirim item"
         record.report.stockRevision = state.tradeStockRevision or 0
@@ -4672,6 +4806,7 @@ do
     local requestFn = env.request or env.http_request or request or http_request
         or (syn and syn.request) or (http and http.request) or (fluxus and fluxus.request)
     local session = HttpService:GenerateGUID(false)
+    state.fishingRunId=session
     local upload, registered, lastVersion, lastFull, failures, initialComplete = nil, false, nil, 0, 0, false
     local lastTradeStockRevision = 0
     local previousReport, reportRevision, supportsDelta = nil, 0, false
@@ -4769,7 +4904,7 @@ do
     local function metadata(snapshot)
         local ctx = state.autoTrade
         return {username = player.Name, displayName = player.DisplayName, placeId = game.PlaceId, gameId = game.GameId,
-            jobId = game.JobId, version = "rennstats/1.8.1", source = state.source, status = state.status,
+            jobId = game.JobId, version = "rennstats/1.9", source = state.source, status = state.status,
             paused = state.paused, lastError = state.lastError, catalogReady = state.catalogReady,
             playerStats = snapshot and snapshot.playerStats or state.playerStats,
             equipment = snapshot and snapshot.equipment or {},
@@ -4781,7 +4916,7 @@ do
     local function briefMetadata()
         local snapshot = state.snapshot
         return {username = player.Name, displayName = player.DisplayName, placeId = game.PlaceId,
-            gameId = game.GameId, jobId = game.JobId, version = "rennstats/1.8.1",
+            gameId = game.GameId, jobId = game.JobId, version = "rennstats/1.9",
             playerStats = snapshot and snapshot.playerStats or state.playerStats, equipment = snapshot and snapshot.equipment or {},
             progress = {phase = not snapshot and "Mengambil inventori" or state.DataReady() and "Siap" or "Memetakan informasi item",
                 complete = state.DataReady()}}
@@ -4841,7 +4976,7 @@ do
                         if not isolated and (state.busy or state.snapshot ~= snapshot or state.revision ~= revision
                             or generation ~= (state.inputGeneration or 0) or not state.PublishReady()) then return end
                         local encodeStarted = os.clock()
-                        local report = {inventory = inventory, choices = available, metadata = metadata(snapshot), revision=reportRevision+1,
+                        local report = {inventory = inventory, choices = available, fishing=snapshot.fishing, metadata = metadata(snapshot), revision=reportRevision+1,
                             capturedAt = snapshot.capturedAt or state.capturedAt, tradeStockRevision = snapshot.tradeStockRevision or 0, schema = "rennstats/v1"}
                         local full = not previousReport or not supportsDelta or os.clock() - lastReconcile >= 600
                         local payload = full and report or Core.reportDelta(previousReport,report,reportCheckpoint)
