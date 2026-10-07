@@ -1,4 +1,4 @@
--- RennStats 1.9 | incremental inventory collector and website-controlled trade.
+-- RennStats 1.9.1 | incremental inventory collector and website-controlled trade.
 -- Backup: lua/backups/renn-inventory-before-rennstats-20261004.lua
 -- Set getgenv()._rennkey before executing. API: https://rennstats.rennhsg.my.id.
 local Core = (function()
@@ -2107,7 +2107,8 @@ local Core = (function()
         local prior=history.previous
         for _,tier in ipairs({"secret","forgotten"}) do
             local suffix=tier=="secret" and "Secret" or "Forgotten"
-            current[tier.."At"]=number(analytics["Last"..suffix.."Timestamp"])
+            local stamp=analytics["Last"..suffix.."Timestamp"]
+            current[tier.."At"]=type(stamp)=="number" and stamp==stamp and stamp>=0 and stamp<=sample.at+300 and stamp or nil
             current[tier.."Since"]=number(analytics["FishSinceLast"..suffix])
         end
         local count=prior and caught-prior.caught or 0
@@ -2164,7 +2165,7 @@ local Core = (function()
         history.previous=current
         local report={runId=sample.runId,at=sample.at,totalCaught=caught}
         for _,key in ipairs({"caught","classified","secret","forgotten","secretGapSum","secretGapCount","forgottenGapSum","forgottenGapCount"}) do report[key]=history[key] end
-        for _,tier in ipairs({"secret","forgotten"}) do report[tier.."At"]=current[tier.."At"];report[tier.."Since"]=current[tier.."Since"] end
+        for _,tier in ipairs({"secret","forgotten"}) do report[tier.."At"]=current[tier.."At"] and math.floor(current[tier.."At"]);report[tier.."Since"]=current[tier.."Since"] end
         local unchanged=history.lastReport~=nil
         if unchanged then for key,value in pairs(report) do if key~="at" and history.lastReport[key]~=value then unchanged=false;break end end end
         if unchanged then for key in pairs(history.lastReport) do if key~="at" and report[key]==nil then unchanged=false;break end end end
@@ -2922,7 +2923,7 @@ local state = {
     observed = Core.eventStore(), equipmentObserved = Core.equipmentEvents(), remoteCount = 0, partial = true,
     cacheReaderProbes = {},
     bag = Core.bagLedger(player.UserId),
-    playerGui = playerGui, revision = 0, statsRevision = 0, collectorVersion = "1.9",
+    playerGui = playerGui, revision = 0, statsRevision = 0, collectorVersion = "1.9.1",
 }
 if reuse then
     state.bag = previous.bag; Core.bagReindex(state.bag, state.catalog)
@@ -4904,7 +4905,7 @@ do
     local function metadata(snapshot)
         local ctx = state.autoTrade
         return {username = player.Name, displayName = player.DisplayName, placeId = game.PlaceId, gameId = game.GameId,
-            jobId = game.JobId, version = "rennstats/1.9", source = state.source, status = state.status,
+            jobId = game.JobId, version = "rennstats/1.9.1", source = state.source, status = state.status,
             paused = state.paused, lastError = state.lastError, catalogReady = state.catalogReady,
             playerStats = snapshot and snapshot.playerStats or state.playerStats,
             equipment = snapshot and snapshot.equipment or {},
@@ -4916,7 +4917,7 @@ do
     local function briefMetadata()
         local snapshot = state.snapshot
         return {username = player.Name, displayName = player.DisplayName, placeId = game.PlaceId,
-            gameId = game.GameId, jobId = game.JobId, version = "rennstats/1.9",
+            gameId = game.GameId, jobId = game.JobId, version = "rennstats/1.9.1",
             playerStats = snapshot and snapshot.playerStats or state.playerStats, equipment = snapshot and snapshot.equipment or {},
             progress = {phase = not snapshot and "Mengambil inventori" or state.DataReady() and "Siap" or "Memetakan informasi item",
                 complete = state.DataReady()}}
