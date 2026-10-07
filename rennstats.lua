@@ -1,4 +1,4 @@
--- RennStats 1.9.1 | incremental inventory collector and website-controlled trade.
+-- RennStats 1.10 | incremental inventory collector and website-controlled trade.
 -- Backup: lua/backups/renn-inventory-before-rennstats-20261004.lua
 -- Set getgenv()._rennkey before executing. API: https://rennstats.rennhsg.my.id.
 local Core = (function()
@@ -2172,6 +2172,139 @@ local Core = (function()
         if unchanged and sample.at-history.lastReport.at<10800 then return history,history.lastReport end
         history.lastReport=report;return history,report
     end
+    do
+        local period, retention = 43200, 604800
+        local keys = {"caught","classified","secret","forgotten","secretGapSum","secretGapCount","forgottenGapSum","forgottenGapCount",
+            "secretMutationKnown","secretMutated","forgottenMutationKnown","forgottenMutated"}
+        local function integer(v) return type(v)=="number" and v==v and v>=0 and v<=1e12 and v%1==0 end
+        local function trim(v) return (v:gsub("<.->",""):match("^%s*(.-)%s*$") or "") end
+        local function zero(at) local row={at=at};for _,key in ipairs(keys) do row[key]=0 end;return row end
+        local function bucket(h,at)
+            local start=math.floor(at/period)*period;local key=tostring(start)
+            h.buckets[key]=h.buckets[key] or zero(start)
+            for k,row in pairs(h.buckets) do if row.at<start-retention then h.buckets[k]=nil end end
+            return h.buckets[key]
+        end
+        function M.rareHistory(runId,at)
+            return {schema=2,runId=runId,startedAt=at,totals=zero(0),buckets={},seen={},seenOrder={},previousCaught=nil,initialized=false}
+        end
+        function M.rareRestore(value)
+            if type(value)~="table" or value.schema~=2 or type(value.runId)~="string" or not value.runId:match("^[%x%-]+$")
+                or #value.runId<32 or #value.runId>40 or type(value.totals)~="table" or type(value.buckets)~="table"
+                or type(value.seenOrder)~="table" or #value.seenOrder>512 then return nil end
+            for _,key in ipairs(keys) do if not integer(value.totals[key]) then return nil end end
+            local count=0
+            for key,row in pairs(value.buckets) do
+                count+=1;if count>15 or type(row)~="table" or not integer(row.at) or row.at%period~=0 or tostring(row.at)~=key then return nil end
+                for _,field in ipairs(keys) do if not integer(row[field]) or row[field]>value.totals[field] then return nil end end
+                for _,tier in ipairs({"secret","forgotten"}) do if row[tier.."Mutated"]>row[tier.."MutationKnown"] or row[tier.."MutationKnown"]>row[tier] then return nil end end
+            end
+            if value.previousCaught~=nil and not integer(value.previousCaught) then return nil end
+            if not integer(value.startedAt) or value.lastSampleAt~=nil and not integer(value.lastSampleAt) then return nil end
+            for _,tier in ipairs({"secret","forgotten"}) do
+                if value.totals[tier.."Mutated"]>value.totals[tier.."MutationKnown"] or value.totals[tier.."MutationKnown"]>value.totals[tier] then return nil end
+                for _,suffix in ipairs({"At","Since","Index"}) do if value[tier..suffix]~=nil and not integer(value[tier..suffix]) then return nil end end
+            end
+            value.seen={};for _,id in ipairs(value.seenOrder) do if type(id)~="string" or #id>128 then return nil end;value.seen[id]=true end
+            if value.pending~=nil and (type(value.pending)~="table" or value.pending.schema~=2 or value.pending.runId~=value.runId or not integer(value.pending.at)) then return nil end
+            value.previousCaught=nil;value.initialized=false;return value
+        end
+        function M.rareSample(h,caught,at,analytics)
+            if not integer(caught) or not integer(at) then return false end
+            local previous=h.previousCaught;local delta=previous and caught-previous or 0
+            if previous and delta<0 or not previous and h.totalCaught and caught<h.totalCaught then
+                h.secretIndex=nil;h.forgottenIndex=nil;h.secretSince=nil;h.forgottenSince=nil
+            end
+            if delta>0 and h.lastSampleAt and at>=h.lastSampleAt and at-h.lastSampleAt<=300 then
+                h.totals.caught+=delta;bucket(h,at).caught+=delta
+            end
+            h.totalCaught=caught;h.previousCaught=caught;h.lastSampleAt=at;h.initialized=true
+            for _,tier in ipairs({"secret","forgotten"}) do
+                local name=tier=="secret" and "Secret" or "Forgotten";local data=analytics or {}
+                local stamp=data["Last"..name.."Timestamp"];local since=data["FishSinceLast"..name]
+                if type(stamp)=="number" and stamp==stamp and stamp>0 and stamp<=at+300 then h[tier.."At"]=math.max(h[tier.."At"] or 0,math.floor(stamp)) end
+                if integer(since) and since<=caught then
+                    h[tier.."Since"]=since
+                    if not h[tier.."Index"] and h[tier.."At"] then h[tier.."Index"]=caught-since end
+                elseif h[tier.."Index"] and caught>=h[tier.."Index"] then h[tier.."Since"]=caught-h[tier.."Index"] end
+            end
+            return true
+        end
+        -- Adapted narrowly from rennmonitoring.lua: server catch text only, no Discord or catalog discovery.
+        function M.rareMessage(text,username,sourceUserId,globalContext)
+            if type(text)~="string" or #text>2048 or sourceUserId~=nil or globalContext then return nil end
+            local plain=trim(text);local lower=plain:lower()
+            if lower:find("[global]",1,true) or not lower:find("obtained",1,true) or not lower:find("chance!",1,true) then return nil end
+            plain=plain:gsub("^%[[Ss][Ee][Rr][Vv][Ee][Rr]%]:%s*","")
+            local owner,raw=plain:match("^(.-)%s+[Oo][Bb][Tt][Aa][Ii][Nn][Ee][Dd]%s+[Aa][Nn]?%s+(.-)%s+[Ww][Ii][Tt][Hh]%s+[Aa]%s+.-%s+[Cc][Hh][Aa][Nn][Cc][Ee]!%s*$")
+            if not owner or trim(owner):lower()~=username:lower() then return nil end
+            local spans={}
+            for attributes,inner in text:gmatch("<[Ff][Oo][Nn][Tt]%s+([^>]*)>(.-)</[Ff][Oo][Nn][Tt]>") do
+                if #spans>=12 then return nil end
+                local color=attributes:match('[Cc][Oo][Ll][Oo][Rr]%s*=%s*"([^"]+)"') or attributes:match("[Cc][Oo][Ll][Oo][Rr]%s*=%s*'([^']+)'")
+                local label=trim(inner):gsub("%s*%([^()]*%)%s*$","")
+                if color and label~="" then table.insert(spans,{color=color:lower():gsub("%s+",""),text=label}) end
+            end
+            local fish=spans[#spans];if not fish then return nil end
+            local tier=(fish.color=="rgb(24,255,152)" or fish.color=="#18ff98") and "secret"
+                or (fish.color=="rgb(0,0,0)" or fish.color=="#000000") and "forgotten" or nil
+            if not tier then return nil end
+            local function mutationLabel(label)
+                label=label:lower()
+                for _,word in ipairs({"shiny","big","mega","none","normal"}) do label=label:gsub("%f[%a]"..word.."%f[%A]","") end
+                return trim(label)
+            end
+            local labels={};for i=1,#spans-1 do
+                local label=spans[i].text:lower()
+                if label~=username:lower() and label~="server" and not label:find("[server]",1,true) then
+                    label=mutationLabel(label);if label~="" then table.insert(labels,label) end
+                end
+            end
+            raw=trim(raw):gsub("%s*%([^()]*%)%s*$","")
+            local suffix=raw:sub(-#fish.text):lower()==fish.text:lower()
+            local prefix=suffix and mutationLabel(raw:sub(1,#raw-#fish.text)) or ""
+            return {tier=tier,mutated=#labels>0 or prefix~="",mutationKnown=#labels>0 or suffix,quantity=1}
+        end
+        function M.rareCatch(h,event,id,at,caught)
+            if type(event)~="table" or (event.tier~="secret" and event.tier~="forgotten") or type(id)~="string" or #id>128
+                or h.seen[id] or not integer(at) or event.quantity~=1 then return false end
+            h.seen[id]=true;table.insert(h.seenOrder,id)
+            while #h.seenOrder>512 do h.seen[table.remove(h.seenOrder,1)]=nil end
+            local tier=event.tier;local row=bucket(h,at)
+            h.totals[tier]+=1;row[tier]+=1
+            if event.mutationKnown then
+                h.totals[tier.."MutationKnown"]+=1;row[tier.."MutationKnown"]+=1
+                if event.mutated then h.totals[tier.."Mutated"]+=1;row[tier.."Mutated"]+=1 end
+            end
+            if integer(caught) then
+                local previous=h[tier.."Index"]
+                if previous and caught>previous then
+                    h.totals[tier.."GapSum"]+=caught-previous;h.totals[tier.."GapCount"]+=1
+                    row[tier.."GapSum"]+=caught-previous;row[tier.."GapCount"]+=1
+                end
+                h[tier.."Index"]=caught;h[tier.."Since"]=0
+            end
+            h[tier.."At"]=at;return true
+        end
+        function M.rareReport(h,at)
+            if not h.initialized then return nil end
+            if h.pending and h.pending.at<at-retention then h.pending=nil end
+            if h.pending then return h.pending end
+            local current=math.floor(at/period)*period
+            if h.sentPeriod==current then return nil end
+            local report={schema=2,runId=h.runId,at=at,totalCaught=h.totalCaught,buckets={}}
+            local open=h.buckets[tostring(current)] or zero(current)
+            for _,key in ipairs(keys) do report[key]=h.totals[key]-open[key] end
+            for _,tier in ipairs({"secret","forgotten"}) do report[tier.."At"]=h[tier.."At"];report[tier.."Since"]=h[tier.."Since"] end
+            for _,row in pairs(h.buckets) do if row.at<current and row.at>=current-retention then table.insert(report.buckets,table.clone(row)) end end
+            table.sort(report.buckets,function(a,b) return a.at<b.at end)
+            h.pending=report;return report
+        end
+        function M.rareAcknowledge(h,report)
+            if h.pending~=report then return false end
+            h.sentPeriod=math.floor(report.at/period)*period;h.pending=nil;return true
+        end
+    end
     function M.tradeItemKey(row) return row.category .. "\0" .. tostring(row.id) .. "\0" .. row.name end
     function M.tradeRequestMatches(request, key)
         if request.byItem then return key:match("^([^%z]*%z[^%z]*%z[^%z]*)") == request.key end
@@ -3287,6 +3420,7 @@ local function bindSource(replion)
     state.captureSubscribed = false
     local function changed(_, path)
         if not state.alive then return end
+        if state.SampleStatistics then state.SampleStatistics(replion.Data,path) end
         if not Core.sourceChangeRelevant(path, CONFIG.InventoryPaths, replion._channel) then
             state.sourcePassiveUpdates = (state.sourcePassiveUpdates or 0) + 1
             return
@@ -4063,7 +4197,9 @@ refresh = function(force)
             snapshot.equipment = {}
             snapshot.playerStats = {}
             for _, key in ipairs({"coins", "caught", "rarestFish"}) do snapshot.playerStats[key] = state.playerStats[key] end
-            if state.fishingRunId then
+            if state.SampleStatistics then
+                state.SampleStatistics(state.profileData)
+            elseif state.fishingRunId then
                 state.fishingHistory,snapshot.fishing=Core.fishingObserve(state.fishingHistory,state.profileData,flat,
                     {runId=state.fishingRunId,source=state.replion or source,inventory=capture and inventory or nil,catalog=readCatalog,at=os.time(),caught=snapshot.playerStats.caught and snapshot.playerStats.caught.value,
                         complete=not partial and not flat.truncated and flat.unresolved==0,trading=state.autoTrade~=nil or player:GetAttribute("IsTrading")==true},checkpoint)
@@ -4849,6 +4985,86 @@ do
         state.transport.sentBytes = state.transport.sentBytes + #body
         return result
     end
+    do
+        local cacheName=tostring(player.UserId).."-"..url:gsub("^https://",""):gsub("[^%w_.%-]","_")
+        local filename="RennStatsStatistics/"..cacheName..".json"
+        env.RENN_STATS_HISTORY=type(env.RENN_STATS_HISTORY)=="table" and env.RENN_STATS_HISTORY or {}
+        local history=Core.rareRestore(env.RENN_STATS_HISTORY[cacheName])
+        if not history and type(env.readfile or readfile)=="function" then
+            local ok,raw=pcall(env.readfile or readfile,filename)
+            if ok and type(raw)=="string" and #raw<=128000 then
+                local decoded,value=pcall(HttpService.JSONDecode,HttpService,raw)
+                if decoded then history=Core.rareRestore(value) end
+            end
+        end
+        history=history or Core.rareHistory(HttpService:GenerateGUID(false),os.time())
+        state.rareStatistics=history
+        local dirty=false;local lastSave=0
+        state.SaveStatistics=function(force)
+            env.RENN_STATS_HISTORY[cacheName]=history
+            if not dirty or not force and os.clock()-lastSave<60 then return end
+            local make,write=env.makefolder or makefolder,env.writefile or writefile
+            if type(make)=="function" then pcall(make,"RennStatsStatistics") end
+            if type(write)=="function" then
+                local savedHistory=table.clone(history);savedHistory.seen=nil
+                local ok,body=pcall(HttpService.JSONEncode,HttpService,savedHistory)
+                if ok and #body<=128000 then local saved=pcall(write,filename,body);if saved then dirty=false end end
+            end
+            lastSave=os.clock()
+        end
+        state.SampleStatistics=function(profile,path)
+            if type(profile)~="table" then return end
+            if path then
+                local parts=type(path)=="table" and table.concat(path,".") or tostring(path)
+                if not parts:find("FishCaught",1,true) and not parts:find("TotalCaught",1,true) and not parts:find("Analytics",1,true) then return end
+            end
+            local root=profile
+            for _,name in ipairs({"Data","Profile"}) do if type(root[name])=="table" and type(root[name].Statistics)=="table" then root=root[name];break end end
+            local stats=root.Statistics or root.Stats or root
+            local caught=stats.FishCaught or stats.TotalFishCaught or root.TotalFishCaught or root.TotalCaught
+            if Core.rareSample(history,caught,os.time(),root.Analytics) then dirty=true end
+        end
+        state.SendStatistics=function()
+            if not history.initialized then
+                local caught=state.playerStats and state.playerStats.caught
+                if caught and caught.status=="known" then Core.rareSample(history,caught.value,os.time()) end
+            end
+            state.SaveStatistics(false)
+            local report=Core.rareReport(history,os.time())
+            if not report or os.clock()<(state.statisticsRetryAt or 0) then return end
+            dirty=true;state.SaveStatistics(true)
+            local ok,result=pcall(post,{action="fishing_report",report=report})
+            if ok then
+                Core.rareAcknowledge(history,report);dirty=true;state.SaveStatistics(true)
+                state.statisticsFailures=0;state.statisticsError=nil
+            else
+                state.statisticsFailures=math.min(6,(state.statisticsFailures or 0)+1)
+                state.statisticsRetryAt=os.clock()+math.min(3600,60*2^state.statisticsFailures)
+                state.statisticsError=tostring(result)
+            end
+        end
+        local ok,chat=pcall(function()return game:GetService("TextChatService")end)
+        if ok and chat and chat.MessageReceived then
+            local seen=setmetatable({}, {__mode="k"})
+            local connection=chat.MessageReceived:Connect(function(message)
+                if not state.alive or state.paused or seen[message] then return end
+                seen[message]=true
+                local text=message.Text or "";if not text:lower():find("obtained",1,true) then return end
+                local context=(tostring(message.PrefixText or "").." "..tostring(message.Metadata or "").." "..tostring(message.TextChannel and message.TextChannel.Name or "")):lower()
+                local global=context:match("%f[%a]global%f[%A]") or context:find("globalalerts",1,true)
+                local event=Core.rareMessage(text,player.Name,message.TextSource and message.TextSource.UserId,global~=nil)
+                if not event then return end
+                local token=type(message.MessageId)=="string" and message.MessageId~="" and message.MessageId or HttpService:GenerateGUID(false)
+                local at=os.time()
+                spawnTask(function()
+                    if not state.alive then return end
+                    state.SampleStatistics(state.replion and state.replion.Data or state.profileData)
+                    if Core.rareCatch(history,event,token,at,history.previousCaught) then dirty=true;state.SaveStatistics(false) end
+                end)
+            end)
+            table.insert(state.connections,connection)
+        end
+    end
     local function command(command)
         if type(command) ~= "table" or type(command.id) ~= "string" or seenCommands[command.id] then return end
         seenCommands[command.id] = true -- Mark before running: mutations are never repeated after a lost response.
@@ -4905,7 +5121,7 @@ do
     local function metadata(snapshot)
         local ctx = state.autoTrade
         return {username = player.Name, displayName = player.DisplayName, placeId = game.PlaceId, gameId = game.GameId,
-            jobId = game.JobId, version = "rennstats/1.9.1", source = state.source, status = state.status,
+            jobId = game.JobId, version = "rennstats/1.10", source = state.source, status = state.status,
             paused = state.paused, lastError = state.lastError, catalogReady = state.catalogReady,
             playerStats = snapshot and snapshot.playerStats or state.playerStats,
             equipment = snapshot and snapshot.equipment or {},
@@ -4917,7 +5133,7 @@ do
     local function briefMetadata()
         local snapshot = state.snapshot
         return {username = player.Name, displayName = player.DisplayName, placeId = game.PlaceId,
-            gameId = game.GameId, jobId = game.JobId, version = "rennstats/1.9.1",
+            gameId = game.GameId, jobId = game.JobId, version = "rennstats/1.10",
             playerStats = snapshot and snapshot.playerStats or state.playerStats, equipment = snapshot and snapshot.equipment or {},
             progress = {phase = not snapshot and "Mengambil inventori" or state.DataReady() and "Siap" or "Memetakan informasi item",
                 complete = state.DataReady()}}
@@ -4938,6 +5154,7 @@ do
     local closeReader = state.Close
     state.Close = function()
         if not state.alive then return end
+        if state.SaveStatistics then state.SaveStatistics(true) end
         state.automation.enabled = false
         state.StopAutoTrade("Collector ditutup")
         if registered then pcall(post, {action = "goodbye"}, 5); registered = false end
@@ -4956,6 +5173,7 @@ do
                     consume(hello); registered = true
                 end
                 pollControl()
+                if state.SendStatistics then state.SendStatistics() end
                 local progressDue = not initialComplete and (lastVersion == nil or state.revision ~= lastVersion or state.DataReady())
                 local tradeDue = (state.tradeStockRevision or 0) > lastTradeStockRevision
                 local changedDue = supportsDelta and state.revision ~= lastVersion
@@ -4977,7 +5195,7 @@ do
                         if not isolated and (state.busy or state.snapshot ~= snapshot or state.revision ~= revision
                             or generation ~= (state.inputGeneration or 0) or not state.PublishReady()) then return end
                         local encodeStarted = os.clock()
-                        local report = {inventory = inventory, choices = available, fishing=snapshot.fishing, metadata = metadata(snapshot), revision=reportRevision+1,
+                        local report = {inventory = inventory, choices = available, metadata = metadata(snapshot), revision=reportRevision+1,
                             capturedAt = snapshot.capturedAt or state.capturedAt, tradeStockRevision = snapshot.tradeStockRevision or 0, schema = "rennstats/v1"}
                         local full = not previousReport or not supportsDelta or os.clock() - lastReconcile >= 600
                         local payload = full and report or Core.reportDelta(previousReport,report,reportCheckpoint)
