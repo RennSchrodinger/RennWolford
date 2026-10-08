@@ -1,4 +1,4 @@
--- RennStats 1.10 | incremental inventory collector and website-controlled trade.
+-- RennStats 1.13 | full-body Roblox avatars and optimized website reporting.
 -- Backup: lua/backups/renn-inventory-before-rennstats-20261004.lua
 -- Set getgenv()._rennkey before executing. API: https://rennstats.rennhsg.my.id.
 local Core = (function()
@@ -248,6 +248,20 @@ local Core = (function()
         local a, b, c, d, e = text:match("^(%x+)%-(%x+)%-(%x+)%-(%x+)%-(%x+)$")
         if a and #a == 8 and #b == 4 and #c == 4 and #d == 4 and #e == 12
             and c:sub(1, 1) == "4" and d:sub(1, 1):match("[89ab]") then return text end
+        return nil
+    end
+    function M.avatarThumbnail(payload,userId)
+        if type(payload)~="table" or type(payload.data)~="table" then return nil end
+        for _,row in ipairs(payload.data) do
+            if type(row)=="table" and tonumber(row.targetId)==userId and row.state=="Completed" and type(row.imageUrl)=="string" then
+                local url=row.imageUrl;local host=url:match("^https://([^/%?#]+)")
+                host=host and host:lower()
+                if #url<=1200 and not url:find("[%c%s]") and host
+                    and (host=="rbxcdn.com" or host:match("^[%w%-%.]+%.rbxcdn%.com$")) then
+                    return {userId=userId,kind="fullBody",url=url}
+                end
+            end
+        end
         return nil
     end
     -- Older package builds and executor module loaders may expose different call styles.
@@ -1049,6 +1063,24 @@ local Core = (function()
     end
     function M.normalize(inventory, catalog, options)
         options = options or {}
+        -- Identity reuse is restricted to collector-owned immutable snapshots.
+        -- Live tables, filtered reads and changed traversal limits cannot use it.
+        local memo = options.ImmutableCache
+        local version = M.catalogVersion(catalog)
+        if memo and (memo.catalog ~= catalog or memo.version ~= version
+            or memo.collectRecords ~= options.CollectRecords or memo.collectDefinitions ~= options.CollectDefinitions) then
+            table.clear(memo); memo.catalog = catalog; memo.version = version
+            memo.collectRecords = options.CollectRecords; memo.collectDefinitions = options.CollectDefinitions
+            memo.records = {}; memo.byUUID = {}
+        end
+        local reuseSnapshot = memo and not options.UUIDs
+        if reuseSnapshot and memo.inventory == inventory and memo.result
+            and memo.maxNodes == (options.MaxNodes or 200000) and memo.category == options.Category
+            and memo.path == options.Path and memo.collection == options.Collection then
+            if options.Checkpoint then options.Checkpoint() end
+            memo.snapshotHits = (memo.snapshotHits or 0) + 1
+            return memo.result
+        end
         local result = { rows = {}, total = 0, unresolved = 0, missingIcons = 0, visited = 0, skipped = 0, truncated = false,
             mutationDiagnostics={total=0,known=0,none=0,unmapped=0,unknown=0,invalid=0,samples={}} }
         local mutationSamples={}
@@ -1172,26 +1204,27 @@ local Core = (function()
             end
             if #row.paths < 5 then table.insert(row.paths, path) end
         end
-        -- Only collector-owned immutable records may use this cache. Live trade reads
-        -- deliberately keep the uncached path. Replace both indexes after each read
+        -- Only collector-owned immutable records may use this cache. Trade probes
+        -- capture live stock first. Replace both indexes after each changed read
         -- so removed records and superseded versions cannot accumulate.
-        local memo = options.ImmutableCache
-        if memo and (memo.catalog ~= catalog or memo.version ~= M.catalogVersion(catalog)
-            or memo.collectRecords ~= options.CollectRecords or memo.collectDefinitions ~= options.CollectDefinitions) then
-            table.clear(memo); memo.catalog = catalog; memo.version = M.catalogVersion(catalog)
-            memo.collectRecords = options.CollectRecords; memo.collectDefinitions = options.CollectDefinitions
-            memo.records = {}
-            memo.byUUID = {}
-        end
         local nextUUID = memo and {} or nil
         local nextRecords = memo and {} or nil
         local function emit(record, key, category, path, scalarQty, collection)
             if not memo or scalarQty ~= nil or options.UUIDs then rawEmit(record, key, category, path, scalarQty, collection); return end
-            local uid = M.uuid(first(record,uniqueFields) or (type(record.Data)=="table" and first(record.Data,uniqueFields)) or key)
-            local cacheKey = key
-            if uid and (first(record,idFields) or first(record,nameFields)
-                or type(record.Data)=="table" and (first(record.Data,idFields) or first(record.Data,nameFields))) then cacheKey = uid end
-            local cached = nextRecords[record] or memo.records[record] or (uid and memo.byUUID[uid])
+            local exact = nextRecords[record] or memo.records[record]
+            local uid, cacheKey
+            if exact and (exact.sourceKey == key or exact.stableKey) then
+                uid = exact.uid; cacheKey = exact.key
+            else
+                uid = M.uuid(first(record,uniqueFields) or (type(record.Data)=="table" and first(record.Data,uniqueFields)) or key)
+                cacheKey = key
+                if uid and (first(record,idFields) or first(record,nameFields)
+                    or type(record.Data)=="table" and (first(record.Data,idFields) or first(record.Data,nameFields))) then cacheKey = uid end
+            end
+            -- Fresh trade captures have no shared table identities. Anonymous or
+            -- malformed UUID records cannot benefit from a cross-capture cache.
+            if options.CacheUUIDsOnly and not uid then rawEmit(record,key,category,path,scalarQty,collection);return end
+            local cached = exact or (uid and memo.byUUID[uid])
             local reusable = cached and cached.key == cacheKey and cached.category == category and cached.collection == collection
                 and M.dataEqual(cached.input,record,options.Checkpoint)
             if not reusable then
@@ -1201,7 +1234,10 @@ local Core = (function()
                     mutationDiagnostics = {total=0,known=0,none=0,unmapped=0,unknown=0,invalid=0,samples={}}}
                 groups, seenInstances, mutationSamples = {}, {}, {}
                 rawEmit(record, key, category, path, scalarQty, collection)
-                cached = {key=cacheKey,category=category,collection=collection,value=result,input=record}
+                local explicitUID = M.uuid(first(record,uniqueFields)
+                    or (type(record.Data)=="table" and first(record.Data,uniqueFields)))
+                cached = {key=cacheKey,sourceKey=key,uid=uid,stableKey=uid~=nil and explicitUID==uid and cacheKey==uid,
+                    category=category,collection=collection,value=result,input=record}
                 result, groups, seenInstances, mutationSamples = outer, outerGroups, outerSeen, outerSamples
                 memo.misses = (memo.misses or 0) + 1
             else memo.hits = (memo.hits or 0) + 1 end
@@ -1213,9 +1249,9 @@ local Core = (function()
             if rowUUID and seenInstances[rowUUID] then return end
             if rowUUID then seenInstances[rowUUID] = true end
             result.total += part.total; result.skipped += part.skipped
-            for field, count in pairs(part.mutationDiagnostics) do
-                if field ~= "samples" then result.mutationDiagnostics[field] += count end
-            end
+            local diagnostic, delta = result.mutationDiagnostics, part.mutationDiagnostics
+            diagnostic.total += delta.total; diagnostic.known += delta.known; diagnostic.none += delta.none
+            diagnostic.unmapped += delta.unmapped; diagnostic.unknown += delta.unknown; diagnostic.invalid += delta.invalid
             for _, sample in ipairs(part.mutationDiagnostics.samples) do
                 if (mutationSamples[sample.status] or 0) < 3 then
                     mutationSamples[sample.status] = (mutationSamples[sample.status] or 0) + 1
@@ -1234,7 +1270,8 @@ local Core = (function()
                 target = table.clone(row); target.instances = table.clone(row.instances); target.paths = {path}
                 groups[row.key] = target; table.insert(result.rows, target)
             else
-                for _, field in ipairs({"qty","records","favoriteQty","lockedQty"}) do target[field] += row[field] end
+                target.qty += row.qty; target.records += row.records
+                target.favoriteQty += row.favoriteQty; target.lockedQty += row.lockedQty
                 if target.icon == "" then target.icon = row.icon end
                 if row.minWeight then target.minWeight = math.min(target.minWeight or row.minWeight, row.minWeight) end
                 if row.maxWeight then target.maxWeight = math.max(target.maxWeight or row.maxWeight, row.maxWeight) end
@@ -1293,6 +1330,13 @@ local Core = (function()
             if a.name ~= b.name then return a.name:lower() < b.name:lower() end
             return a.key < b.key
         end)
+        if memo then
+            -- Never retain an identity shortcut from a UUID-filtered read.
+            memo.inventory = reuseSnapshot and inventory or nil
+            memo.result = reuseSnapshot and result or nil
+            memo.maxNodes = limit; memo.category = options.Category
+            memo.path = options.Path; memo.collection = options.Collection
+        end
         return result
     end
     function M.diff(before, after)
@@ -2252,6 +2296,7 @@ local Core = (function()
             local function mutationLabel(label)
                 label=label:lower()
                 for _,word in ipairs({"shiny","big","mega","none","normal"}) do label=label:gsub("%f[%a]"..word.."%f[%A]","") end
+                if not label:find("%w") then return "" end -- Separators between traits are not mutation names.
                 return trim(label)
             end
             local labels={};for i=1,#spans-1 do
@@ -2309,6 +2354,70 @@ local Core = (function()
     function M.tradeRequestMatches(request, key)
         if request.byItem then return key:match("^([^%z]*%z[^%z]*%z[^%z]*)") == request.key end
         return request.key == key
+    end
+    -- Index the complete fresh read, then evaluate trade rules only for requested
+    -- groups. Keeping all unresolved IDs preserves the conservative fallback.
+    function M.tradeStock(flat, catalog, requests, checkpoint, cache)
+        if flat.truncated then return nil, "Pembacaan stok terpotong" end
+        local index = cache and cache.flat == flat and cache.catalog == catalog
+            and cache.version == M.catalogVersion(catalog) and cache.index or nil
+        if not index then
+            index = {rows={},byItem={},records={},unresolved={},choices={}}
+            for _, row in ipairs(flat.rows) do
+                if checkpoint then checkpoint() end
+                index.rows[row.key] = row
+                local itemKey = row.key:match("^([^%z]*%z[^%z]*%z[^%z]*)")
+                local variants = index.byItem[itemKey] or {}
+                index.byItem[itemKey] = variants; table.insert(variants,row.key)
+                if not M.itemReady(row) then
+                    local pending = index.unresolved[row.category] or {}
+                    index.unresolved[row.category] = pending; pending[tostring(row.id)] = true
+                end
+            end
+            for _, record in ipairs(flat.items or {}) do
+                if checkpoint then checkpoint() end
+                local records = index.records[record.GroupKey] or {}
+                index.records[record.GroupKey] = records; table.insert(records,record)
+            end
+            if cache then
+                cache.flat = flat; cache.catalog = catalog; cache.version = M.catalogVersion(catalog); cache.index = index
+            end
+        end
+        local function choice(key)
+            local found = index.choices[key]
+            if found ~= nil then return found or nil end
+            local row = index.rows[key]
+            if not row then return nil end
+            local choices = M.tradeChoices(nil,catalog,{rows={row},items=index.records[key] or {}},checkpoint)
+            found = choices[1]; index.choices[key] = found or false
+            return found
+        end
+        local result = {}
+        for _, item in ipairs(requests or {}) do
+            if checkpoint then checkpoint() end
+            local category,id = item.key:match("^([^%z]*)%z([^%z]*)")
+            local unresolved = index.unresolved
+            local pending = (unresolved[category] and unresolved[category][id])
+                or (unresolved.Uncategorized and unresolved.Uncategorized[id])
+            local row
+            if item.byItem then
+                if pending then return nil,"Informasi item tujuan belum selesai dipetakan" end
+                for _, key in ipairs(index.byItem[item.key] or {}) do
+                    local candidate = choice(key)
+                    if candidate then
+                        if not M.itemReady(candidate) then return nil,"Informasi item tujuan belum selesai dipetakan" end
+                        if not row then row={qty=0,lockedQty=0,trade={verifiedUnits=0,unknownUnits=0},resolved=true,name=candidate.name,icon=candidate.icon,key=item.key} end
+                        row.qty += candidate.qty; row.lockedQty += candidate.lockedQty or 0
+                        row.trade.verifiedUnits += candidate.trade.verifiedUnits; row.trade.unknownUnits += candidate.trade.unknownUnits
+                    end
+                end
+            else row = choice(item.key) end
+            if row and not M.itemReady(row) or not row and pending then return nil,"Informasi item tujuan belum selesai dipetakan" end
+            local qty = row and row.qty or 0
+            local eligible = row and (row.trade.verifiedUnits + row.trade.unknownUnits) or 0
+            table.insert(result,{key=item.key,qty=qty,available=math.max(0,math.min(qty-(row and row.lockedQty or 0),eligible))})
+        end
+        return result
     end
     function M.tradeReportedAmounts(values, requests)
         local totals={}
@@ -3056,7 +3165,7 @@ local state = {
     observed = Core.eventStore(), equipmentObserved = Core.equipmentEvents(), remoteCount = 0, partial = true,
     cacheReaderProbes = {},
     bag = Core.bagLedger(player.UserId),
-    playerGui = playerGui, revision = 0, statsRevision = 0, collectorVersion = "1.9.1",
+    playerGui = playerGui, revision = 0, statsRevision = 0, collectorVersion = "1.13",
 }
 if reuse then
     state.bag = previous.bag; Core.bagReindex(state.bag, state.catalog)
@@ -3704,44 +3813,26 @@ end
 state.ReadTradeStock = function(requests)
     local inventory, reason = tradeLocalInventory()
     if not inventory then return nil, reason end
+    -- Capture live stock on every probe. No previous inventory can authorize a
+    -- trade; only immutable definitions and per-record normalization are reused.
     local stock = Core.captureGraph(inventory, CONFIG.MaxInventoryNodes)
-    local catalog = Core.captureGraph(state.catalog, CONFIG.MaxInventoryNodes)
+    local version = Core.catalogVersion(state.catalog)
+    local catalog = state.captureCatalogSource == state.catalog and state.captureCatalogVersion == version
+        and state.captureCatalog or nil
+    if not catalog then
+        catalog = Core.captureGraph(state.catalog, CONFIG.MaxInventoryNodes)
+        state.captureCatalogSource = state.catalog; state.captureCatalogVersion = version; state.captureCatalog = catalog
+    end
     local checkpoint = workCheckpoint()
-    local flat = Core.normalize(stock, catalog, {CollectRecords = true, Checkpoint = checkpoint})
-    if flat.truncated then return nil, "Pembacaan stok terpotong" end
-    local choices = Core.tradeChoices(stock, catalog, flat, checkpoint)
-    local byKey, unresolved, result = {}, {}, {}
-    for _, row in ipairs(choices) do byKey[row.key] = row end
-    for _, candidate in ipairs(flat.rows) do
-        checkpoint()
-        if not Core.itemReady(candidate) then
-            unresolved[candidate.category] = unresolved[candidate.category] or {}
-            unresolved[candidate.category][tostring(candidate.id)] = true
-        end
-    end
-    for _, item in ipairs(requests or {}) do
-        local row = byKey[item.key]
-        if item.byItem then
-            local category,id=item.key:match("^([^%z]*)%z([^%z]*)")
-            if (unresolved[category] and unresolved[category][id]) or (unresolved.Uncategorized and unresolved.Uncategorized[id]) then return nil,"Informasi item tujuan belum selesai dipetakan" end
-            row=nil
-            for _,candidate in ipairs(choices) do if Core.tradeRequestMatches(item,candidate.key) then
-                if not Core.itemReady(candidate) then return nil,"Informasi item tujuan belum selesai dipetakan" end
-                if not row then row={qty=0,lockedQty=0,trade={verifiedUnits=0,unknownUnits=0},resolved=true,name=candidate.name,icon=candidate.icon,key=item.key} end
-                row.qty+=candidate.qty;row.lockedQty+=candidate.lockedQty or 0
-                row.trade.verifiedUnits+=candidate.trade.verifiedUnits;row.trade.unknownUnits+=candidate.trade.unknownUnits
-            end end
-        end
-        if row and not Core.itemReady(row) then return nil, "Informasi item tujuan belum selesai dipetakan" end
-        if not row then
-            local category, id = item.key:match("^([^%z]*)%z([^%z]*)")
-            if unresolved[category] and unresolved[category][id] or unresolved.Uncategorized and unresolved.Uncategorized[id] then return nil, "Informasi item tujuan belum selesai dipetakan" end
-        end
-        local qty = row and row.qty or 0
-        local eligible = row and row.trade and (row.trade.verifiedUnits + row.trade.unknownUnits) or 0
-        table.insert(result, {key = item.key, qty = qty, available = math.max(0, math.min(qty - (row and row.lockedQty or 0), eligible))})
-    end
-    return result
+    local memo = state.tradeNormalizeCache or {}
+    state.tradeNormalizeCache = nil -- Lease it exclusively across yielding work.
+    local ok, flat = pcall(Core.normalize,stock,catalog,{MaxNodes=CONFIG.MaxInventoryNodes,CollectRecords=true,CacheUUIDsOnly=true,
+        Checkpoint=checkpoint,ImmutableCache=memo})
+    if not ok then error(flat,0) end
+    state.tradeNormalizeCache = memo
+    -- Probes may overlap while normalization yields. Their indexes belong to
+    -- their own completed read rather than shared mutable live data.
+    return Core.tradeStock(flat,catalog,requests,checkpoint)
 end
 state.PrepareTrade = function(targetId, requests)
     local target = tonumber(targetId) and Players:GetPlayerByUserId(tonumber(targetId))
@@ -4214,17 +4305,14 @@ refresh = function(force)
                 end
             end
             local itemCollection = Core.path(inventory, CONFIG.ItemPath)
-            snapshot.itemRecords = 0
-            if type(itemCollection) == "table" then
+            snapshot.itemRecords = previousFlat == flat and state.snapshot and state.snapshot.itemRecords or 0
+            if previousFlat ~= flat and type(itemCollection) == "table" then
                 for _, item in pairs(itemCollection) do if type(item) == "table" then snapshot.itemRecords = snapshot.itemRecords + 1 end end
             end
-            snapshot.categories = Core.categoryTotals(snapshot.rows)
-            local categoryLines = {}
-            for _, entry in ipairs(snapshot.categories) do
-                table.insert(categoryLines, entry.category .. ": " .. entry.quantity .. " unit; " .. entry.records
-                    .. " record; " .. entry.groups .. " kelompok; belum dipetakan: " .. entry.unresolved)
-            end
-            local signature = source .. "\n" .. rowSignature(snapshot.rows)
+            snapshot.categories = previousFlat == flat and state.snapshot and state.snapshot.categories or Core.categoryTotals(snapshot.rows)
+            local rowsSignature = previousFlat == flat and state.rowSignature or rowSignature(snapshot.rows)
+            local signature = source .. "\n" .. rowsSignature
+            state.rowSignature = rowsSignature
             local changed = signature ~= state.signature or not previousFlat or not Core.dataEqual(previousFlat.items,flat.items,checkpoint)
                 or not Core.dataEqual(state.snapshot and state.snapshot.fishing,snapshot.fishing,checkpoint)
             state.signature = signature; state.baselineSource = source; state.lastTruncated = snapshot.truncated
@@ -4234,7 +4322,13 @@ refresh = function(force)
             if state.QueueDefinitions then state.QueueDefinitions(flat.definitionRequests or {}) end
             state.capturedAt = readMetadata and readMetadata.capturedAt or os.time(); state.partial = partial
             snapshot.capturedAt = state.capturedAt
-            state.diagnosticsReader = function() return table.concat({
+            state.diagnosticsReader = function()
+                local categoryLines = {}
+                for _, entry in ipairs(snapshot.categories) do
+                    table.insert(categoryLines, entry.category .. ": " .. entry.quantity .. " unit; " .. entry.records
+                        .. " record; " .. entry.groups .. " kelompok; belum dipetakan: " .. entry.unresolved)
+                end
+                return table.concat({
                 "Info diperbarui: " .. os.date("%H:%M:%S"),
                 "Player: " .. player.Name .. " | PlaceId: " .. tostring(game.PlaceId),
                 "LocalPlayer.UserId: " .. tostring(player.UserId),
@@ -4793,7 +4887,7 @@ do
         policy.version, policy.enabled = value.version, value.enabled == true
         policy.targets = type(value.targets) == "table" and value.targets or {}
         policy.items = type(value.items) == "table" and value.items or {}
-        policy.completed, policy.cursor, policy.running = {}, 1, nil
+        policy.completed, policy.cursor, policy.running, policy.lookupStarted = {}, 1, nil, nil
         policy.status = policy.enabled and "Menunggu username target masuk server" or "Auto Trade nonaktif"
     end
     spawnTask(function()
@@ -4803,7 +4897,7 @@ do
                     local finished = policy.running
                     policy.running = nil
                     if finished.success then
-                        policy.completed[policy.cursor] = true; policy.cursor = policy.cursor + 1
+                        policy.completed[policy.cursor] = true; policy.cursor = policy.cursor + 1; policy.lookupStarted = nil
                         policy.status = "Pengiriman target selesai"
                         if policy.cursor > #policy.targets then
                             policy.enabled = false; policy.status = "Seluruh target selesai; Auto Trade nonaktif"
@@ -4819,12 +4913,18 @@ do
                     if type(wanted) ~= "string" then
                         policy.enabled = false; policy.status = "Username target tidak valid"; policy.finishedVersion = policy.version
                     else
+                        policy.lookupStarted = policy.lookupStarted or os.clock()
                         local target
                         -- Never resolve arbitrary IDs, DisplayName, or a foreign server.
                         for _, candidate in ipairs(Players:GetPlayers()) do
                             if candidate ~= player and candidate.Name:lower() == wanted:lower() then target = candidate; break end
                         end
-                        if target then
+                        if wanted:lower() == player.Name:lower() or (not target and os.clock() - policy.lookupStarted >= 60) then
+                            policy.status = "Dilewati: penerima tidak ditemukan"
+                            if wanted:lower() == player.Name:lower() then policy.status = "Dilewati: akun ini adalah penerima" end
+                            policy.cursor = policy.cursor + 1; policy.lookupStarted = nil
+                            if policy.cursor > #policy.targets then policy.enabled = false; policy.finishedVersion = policy.version end
+                        elseif target then
                             local accepted, reason = state.StartAutoTrade(target.UserId, policy.items)
                             if accepted then policy.running = state.autoTrade; policy.status = "Mengirim ke " .. target.Name
                             else policy.enabled = false; policy.status = tostring(reason); policy.finishedVersion = policy.version end
@@ -4832,7 +4932,7 @@ do
                     end
                 end
             end
-            task.wait(10)
+            task.wait(policy.enabled and 1 or 10)
         end
     end)
 end
@@ -4873,7 +4973,7 @@ do
         if cache[value.id] then if cache[value.id].report then job = cache[value.id] end; return end
         if job and not job.done and job.phase == "send" then return end
         if job and job.done then cache[job.id] = {done = true} end
-        local record = {id = value.id, phase = value.phase, target = value.target, items = value.items, report = {id = value.id, sent = {}, uncertain = {}, status = "processing", message = "Memeriksa stok aktual"}}
+        local record = {id = value.id, phase = value.phase, target = value.target, items = value.items, lookupDeadline = os.clock() + 60, report = {id = value.id, sent = {}, uncertain = {}, status = "processing", message = "Memeriksa stok aktual"}}
         job = record; cache[value.id] = record; table.insert(order, value.id)
         if #order > 64 then cache[table.remove(order, 1)] = nil end
         if (value.phase == "probe" or value.phase == "send") and type(value.target) == "string"
@@ -4891,7 +4991,7 @@ do
                 record.report.message = ok and stocks and "Stok aktual diperiksa" or tostring(ok and reason or stocks)
                 record.done = true
             end)
-        elseif value.phase == "send" then record.report.message = "Menunggu " .. tostring(value.target) .. " masuk server"
+        elseif value.phase == "send" then record.report.message = "Mencari " .. tostring(value.target) .. " di server"
         else record.done = true; record.report.status = "failed"; record.report.message = "Perintah pengiriman tidak valid" end
     end
     state.TradeReport = function()
@@ -4908,8 +5008,11 @@ do
                 local record = job
                 if record.ctx then
                     if state.autoTrade ~= record.ctx then progress(record, record.ctx, true, state.tradeMessage); record.done = true; record.ctx = nil end
+                elseif os.clock() >= record.lookupDeadline then
+                    record.done = true; record.report.status = "skipped"
+                    record.report.message = "Dilewati: penerima tidak ditemukan dalam 1 menit"
                 elseif os.clock() >= nextLookup then
-                    nextLookup = os.clock() + 10
+                    nextLookup = os.clock() + 1
                     local target
                     for _, candidate in ipairs(Players:GetPlayers()) do
                         if candidate ~= player and type(record.target) == "string" and candidate.Name:lower() == record.target:lower() then target = candidate; break end
@@ -4952,6 +5055,27 @@ do
     local function reportCheckpoint() (state.sharedCheckpoint or reportBudget)() end
     local seenCommands, receipts, acknowledged = {}, {}, {}
     state.transport = {status = "Menunggu konfigurasi", sentBytes = 0, failures = 0}
+    -- One independent thumbnail worker; it never delays inventory or trade.
+    -- Only the local UserId is requested, without website keys or game cookies.
+    if type(requestFn)=="function" then
+        spawnTask(function()
+            while state.alive do
+                local ok,response=pcall(requestFn,{Url="https://thumbnails.roblox.com/v1/users/avatar?userIds="..player.UserId
+                    .."&size=720x720&format=Png&isCircular=false",Method="GET",Timeout=8,Headers={Accept="application/json"}})
+                local avatar
+                if ok and type(response)=="table" and tonumber(response.StatusCode or response.Status or response.status_code)==200 then
+                    local raw=response.Body or response.body
+                    if type(raw)=="string" and #raw<=65536 then
+                        local decoded,payload=pcall(HttpService.JSONDecode,HttpService,raw)
+                        if decoded then avatar=Core.avatarThumbnail(payload,player.UserId) end
+                    end
+                end
+                if not state.alive then return end
+                if avatar then avatar.updatedAt=os.time();state.avatar=avatar end
+                task.wait(avatar and 1800 or 60)
+            end
+        end)
+    end
     state.DataReady = function()
         local snapshot = state.snapshot
         return state.catalogReady and snapshot ~= nil
@@ -5120,8 +5244,8 @@ do
     end
     local function metadata(snapshot)
         local ctx = state.autoTrade
-        return {username = player.Name, displayName = player.DisplayName, placeId = game.PlaceId, gameId = game.GameId,
-            jobId = game.JobId, version = "rennstats/1.10", source = state.source, status = state.status,
+        return {username = player.Name, displayName = player.DisplayName, avatar = state.avatar, placeId = game.PlaceId, gameId = game.GameId,
+            jobId = game.JobId, version = "rennstats/1.13", source = state.source, status = state.status,
             paused = state.paused, lastError = state.lastError, catalogReady = state.catalogReady,
             playerStats = snapshot and snapshot.playerStats or state.playerStats,
             equipment = snapshot and snapshot.equipment or {},
@@ -5132,8 +5256,8 @@ do
     end
     local function briefMetadata()
         local snapshot = state.snapshot
-        return {username = player.Name, displayName = player.DisplayName, placeId = game.PlaceId,
-            gameId = game.GameId, jobId = game.JobId, version = "rennstats/1.10",
+        return {username = player.Name, displayName = player.DisplayName, avatar = state.avatar, placeId = game.PlaceId,
+            gameId = game.GameId, jobId = game.JobId, version = "rennstats/1.13",
             playerStats = snapshot and snapshot.playerStats or state.playerStats, equipment = snapshot and snapshot.equipment or {},
             progress = {phase = not snapshot and "Mengambil inventori" or state.DataReady() and "Siap" or "Memetakan informasi item",
                 complete = state.DataReady()}}
