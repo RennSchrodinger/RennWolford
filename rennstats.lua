@@ -1,4 +1,4 @@
--- RennStats 1.13 | full-body Roblox avatars and optimized website reporting.
+-- RennStats 1.14 | synchronized statistics reset, full-body avatars and optimized reporting.
 -- Backup: lua/backups/renn-inventory-before-rennstats-20261004.lua
 -- Set getgenv()._rennkey before executing. API: https://rennstats.rennhsg.my.id.
 local Core = (function()
@@ -2230,7 +2230,11 @@ local Core = (function()
             return h.buckets[key]
         end
         function M.rareHistory(runId,at)
-            return {schema=2,runId=runId,startedAt=at,totals=zero(0),buckets={},seen={},seenOrder={},previousCaught=nil,initialized=false}
+            return {schema=2,epoch=0,runId=runId,startedAt=at,totals=zero(0),buckets={},seen={},seenOrder={},previousCaught=nil,initialized=false}
+        end
+        function M.rareEpoch(h,epoch,runId,at)
+            if not integer(epoch) or epoch<=(h.epoch or 0) then return h,false end
+            local next=M.rareHistory(runId,at);next.epoch=epoch;return next,true
         end
         function M.rareRestore(value)
             if type(value)~="table" or value.schema~=2 or type(value.runId)~="string" or not value.runId:match("^[%x%-]+$")
@@ -2245,6 +2249,8 @@ local Core = (function()
             end
             if value.previousCaught~=nil and not integer(value.previousCaught) then return nil end
             if not integer(value.startedAt) or value.lastSampleAt~=nil and not integer(value.lastSampleAt) then return nil end
+            if value.epoch~=nil and not integer(value.epoch) then return nil end
+            value.epoch=value.epoch or 0
             for _,tier in ipairs({"secret","forgotten"}) do
                 if value.totals[tier.."Mutated"]>value.totals[tier.."MutationKnown"] or value.totals[tier.."MutationKnown"]>value.totals[tier] then return nil end
                 for _,suffix in ipairs({"At","Since","Index"}) do if value[tier..suffix]~=nil and not integer(value[tier..suffix]) then return nil end end
@@ -2266,8 +2272,9 @@ local Core = (function()
             for _,tier in ipairs({"secret","forgotten"}) do
                 local name=tier=="secret" and "Secret" or "Forgotten";local data=analytics or {}
                 local stamp=data["Last"..name.."Timestamp"];local since=data["FishSinceLast"..name]
-                if type(stamp)=="number" and stamp==stamp and stamp>0 and stamp<=at+300 then h[tier.."At"]=math.max(h[tier.."At"] or 0,math.floor(stamp)) end
-                if integer(since) and since<=caught then
+                if type(stamp)=="number" and stamp==stamp and stamp>0 and stamp<=at+300
+                    and ((h.epoch or 0)==0 or stamp>=h.startedAt) then h[tier.."At"]=math.max(h[tier.."At"] or 0,math.floor(stamp)) end
+                if integer(since) and since<=caught and ((h.epoch or 0)==0 or h[tier.."At"] and h[tier.."At"]>=h.startedAt) then
                     h[tier.."Since"]=since
                     if not h[tier.."Index"] and h[tier.."At"] then h[tier.."Index"]=caught-since end
                 elseif h[tier.."Index"] and caught>=h[tier.."Index"] then h[tier.."Since"]=caught-h[tier.."Index"] end
@@ -3165,7 +3172,7 @@ local state = {
     observed = Core.eventStore(), equipmentObserved = Core.equipmentEvents(), remoteCount = 0, partial = true,
     cacheReaderProbes = {},
     bag = Core.bagLedger(player.UserId),
-    playerGui = playerGui, revision = 0, statsRevision = 0, collectorVersion = "1.13",
+    playerGui = playerGui, revision = 0, statsRevision = 0, collectorVersion = "1.14",
 }
 if reuse then
     state.bag = previous.bag; Core.bagReindex(state.bag, state.catalog)
@@ -5157,15 +5164,33 @@ do
             local report=Core.rareReport(history,os.time())
             if not report or os.clock()<(state.statisticsRetryAt or 0) then return end
             dirty=true;state.SaveStatistics(true)
-            local ok,result=pcall(post,{action="fishing_report",report=report})
+            local sentHistory=history
+            local ok,result=pcall(post,{action="fishing_report",report=report,statisticsEpoch=sentHistory.epoch or 0})
             if ok then
-                Core.rareAcknowledge(history,report);dirty=true;state.SaveStatistics(true)
+                state.ApplyStatisticsEpoch(result.statisticsEpoch)
+                if history==sentHistory and result.statisticsAccepted~=false then
+                    Core.rareAcknowledge(history,report);dirty=true;state.SaveStatistics(true)
+                end
                 state.statisticsFailures=0;state.statisticsError=nil
             else
                 state.statisticsFailures=math.min(6,(state.statisticsFailures or 0)+1)
                 state.statisticsRetryAt=os.clock()+math.min(3600,60*2^state.statisticsFailures)
                 state.statisticsError=tostring(result)
             end
+        end
+        state.ApplyStatisticsEpoch=function(epoch)
+            -- A delayed response may acknowledge an older reset. Never roll back.
+            if type(epoch)~="number" or epoch<=(history.epoch or 0) then return end
+            local next,changed=Core.rareEpoch(history,epoch,HttpService:GenerateGUID(false),os.time())
+            if not changed then return end
+            history=next;state.rareStatistics=history;dirty=true
+            state.statisticsRetryAt=0;state.statisticsFailures=0;state.statisticsError=nil
+            state.SampleStatistics(state.replion and state.replion.Data or state.profileData)
+            if not history.initialized then
+                local caught=state.playerStats and state.playerStats.caught
+                if caught and caught.status=="known" then Core.rareSample(history,caught.value,os.time()) end
+            end
+            state.SaveStatistics(true)
         end
         local ok,chat=pcall(function()return game:GetService("TextChatService")end)
         if ok and chat and chat.MessageReceived then
@@ -5179,9 +5204,9 @@ do
                 local event=Core.rareMessage(text,player.Name,message.TextSource and message.TextSource.UserId,global~=nil)
                 if not event then return end
                 local token=type(message.MessageId)=="string" and message.MessageId~="" and message.MessageId or HttpService:GenerateGUID(false)
-                local at=os.time()
+                local at=os.time();local eventHistory=history
                 spawnTask(function()
-                    if not state.alive then return end
+                    if not state.alive or history~=eventHistory then return end
                     state.SampleStatistics(state.replion and state.replion.Data or state.profileData)
                     if Core.rareCatch(history,event,token,at,history.previousCaught) then dirty=true;state.SaveStatistics(false) end
                 end)
@@ -5233,6 +5258,7 @@ do
         receipts[command.id] = receipt
     end
     local function consume(result)
+        if state.ApplyStatisticsEpoch then state.ApplyStatisticsEpoch(result.statisticsEpoch) end
         for _, id in ipairs(result.acknowledged or {}) do receipts[id] = nil; acknowledged[id] = true end
         for _, entry in ipairs(result.commands or {}) do command(entry) end
         if result.settings then
@@ -5245,7 +5271,7 @@ do
     local function metadata(snapshot)
         local ctx = state.autoTrade
         return {username = player.Name, displayName = player.DisplayName, avatar = state.avatar, placeId = game.PlaceId, gameId = game.GameId,
-            jobId = game.JobId, version = "rennstats/1.13", source = state.source, status = state.status,
+            jobId = game.JobId, version = "rennstats/1.14", source = state.source, status = state.status,
             paused = state.paused, lastError = state.lastError, catalogReady = state.catalogReady,
             playerStats = snapshot and snapshot.playerStats or state.playerStats,
             equipment = snapshot and snapshot.equipment or {},
@@ -5257,7 +5283,7 @@ do
     local function briefMetadata()
         local snapshot = state.snapshot
         return {username = player.Name, displayName = player.DisplayName, avatar = state.avatar, placeId = game.PlaceId,
-            gameId = game.GameId, jobId = game.JobId, version = "rennstats/1.13",
+            gameId = game.GameId, jobId = game.JobId, version = "rennstats/1.14",
             playerStats = snapshot and snapshot.playerStats or state.playerStats, equipment = snapshot and snapshot.equipment or {},
             progress = {phase = not snapshot and "Mengambil inventori" or state.DataReady() and "Siap" or "Memetakan informasi item",
                 complete = state.DataReady()}}
