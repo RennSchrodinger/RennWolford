@@ -1,4 +1,4 @@
--- RennStats 1.14 | synchronized statistics reset, full-body avatars and optimized reporting.
+-- RennStats 1.16 | named mutation counts per completed catch period.
 -- Backup: lua/backups/renn-inventory-before-rennstats-20261004.lua
 -- Set getgenv()._rennkey before executing. API: https://rennstats.rennhsg.my.id.
 local Core = (function()
@@ -2223,6 +2223,24 @@ local Core = (function()
         local function integer(v) return type(v)=="number" and v==v and v>=0 and v<=1e12 and v%1==0 end
         local function trim(v) return (v:gsub("<.->",""):match("^%s*(.-)%s*$") or "") end
         local function zero(at) local row={at=at};for _,key in ipairs(keys) do row[key]=0 end;return row end
+        local function namedMutations(row)
+            local names=row.mutations or {secret={},forgotten={}}
+            if type(names)~="table" then return nil end
+            for key in pairs(names) do if key~="secret" and key~="forgotten" then return nil end end
+            for _,tier in ipairs({"secret","forgotten"}) do
+                names[tier]=names[tier] or {}
+                if type(names[tier])~="table" then return nil end
+                local total,count=0,0
+                for name,qty in pairs(names[tier]) do
+                    count+=1
+                    if count>64 or type(name)~="string" or #name>80 or not name:match("^[a-z][a-z0-9 %+&'/%._%-]*$")
+                        or not integer(qty) or qty<1 then return nil end
+                    total+=qty
+                end
+                if total>row[tier.."Mutated"] then return nil end
+            end
+            return names
+        end
         local function bucket(h,at)
             local start=math.floor(at/period)*period;local key=tostring(start)
             h.buckets[key]=h.buckets[key] or zero(start)
@@ -2246,6 +2264,7 @@ local Core = (function()
                 count+=1;if count>15 or type(row)~="table" or not integer(row.at) or row.at%period~=0 or tostring(row.at)~=key then return nil end
                 for _,field in ipairs(keys) do if not integer(row[field]) or row[field]>value.totals[field] then return nil end end
                 for _,tier in ipairs({"secret","forgotten"}) do if row[tier.."Mutated"]>row[tier.."MutationKnown"] or row[tier.."MutationKnown"]>row[tier] then return nil end end
+                row.mutations=namedMutations(row);if not row.mutations then return nil end
             end
             if value.previousCaught~=nil and not integer(value.previousCaught) then return nil end
             if not integer(value.startedAt) or value.lastSampleAt~=nil and not integer(value.lastSampleAt) then return nil end
@@ -2282,13 +2301,17 @@ local Core = (function()
             return true
         end
         -- Adapted narrowly from rennmonitoring.lua: server catch text only, no Discord or catalog discovery.
-        function M.rareMessage(text,username,sourceUserId,globalContext)
+        function M.rareMessage(text,username,sourceUserId,globalContext,displayName)
             if type(text)~="string" or #text>2048 or sourceUserId~=nil or globalContext then return nil end
             local plain=trim(text);local lower=plain:lower()
             if lower:find("[global]",1,true) or not lower:find("obtained",1,true) or not lower:find("chance!",1,true) then return nil end
             plain=plain:gsub("^%[[Ss][Ee][Rr][Vv][Ee][Rr]%]:%s*","")
             local owner,raw=plain:match("^(.-)%s+[Oo][Bb][Tt][Aa][Ii][Nn][Ee][Dd]%s+[Aa][Nn]?%s+(.-)%s+[Ww][Ii][Tt][Hh]%s+[Aa]%s+.-%s+[Cc][Hh][Aa][Nn][Cc][Ee]!%s*$")
-            if not owner or trim(owner):lower()~=username:lower() then return nil end
+            if not owner then return nil end
+            local ownerName=trim(owner):lower()
+            local accountName=username:lower()
+            local localDisplayName=type(displayName)=="string" and trim(displayName):lower() or nil
+            if ownerName~=accountName and ownerName~=localDisplayName then return nil end
             local spans={}
             for attributes,inner in text:gmatch("<[Ff][Oo][Nn][Tt]%s+([^>]*)>(.-)</[Ff][Oo][Nn][Tt]>") do
                 if #spans>=12 then return nil end
@@ -2304,18 +2327,20 @@ local Core = (function()
                 label=label:lower()
                 for _,word in ipairs({"shiny","big","mega","none","normal"}) do label=label:gsub("%f[%a]"..word.."%f[%A]","") end
                 if not label:find("%w") then return "" end -- Separators between traits are not mutation names.
-                return trim(label)
+                return trim(label:gsub("%s+"," "):gsub("^[%s+&,|]+",""):gsub("[%s+&,|]+$",""))
             end
             local labels={};for i=1,#spans-1 do
                 local label=spans[i].text:lower()
-                if label~=username:lower() and label~="server" and not label:find("[server]",1,true) then
+                if label~=accountName and label~=localDisplayName and label~="server" and not label:find("[server]",1,true) then
                     label=mutationLabel(label);if label~="" then table.insert(labels,label) end
                 end
             end
             raw=trim(raw):gsub("%s*%([^()]*%)%s*$","")
             local suffix=raw:sub(-#fish.text):lower()==fish.text:lower()
             local prefix=suffix and mutationLabel(raw:sub(1,#raw-#fish.text)) or ""
-            return {tier=tier,mutated=#labels>0 or prefix~="",mutationKnown=#labels>0 or suffix,quantity=1}
+            local mutation=prefix~="" and prefix or table.concat(labels," + ")
+            if #mutation>80 or not mutation:match("^[a-z][a-z0-9 %+&'/%._%-]*$") then mutation=nil end
+            return {tier=tier,mutated=#labels>0 or prefix~="",mutationKnown=#labels>0 or suffix,mutation=mutation,quantity=1}
         end
         function M.rareCatch(h,event,id,at,caught)
             if type(event)~="table" or (event.tier~="secret" and event.tier~="forgotten") or type(id)~="string" or #id>128
@@ -2326,7 +2351,15 @@ local Core = (function()
             h.totals[tier]+=1;row[tier]+=1
             if event.mutationKnown then
                 h.totals[tier.."MutationKnown"]+=1;row[tier.."MutationKnown"]+=1
-                if event.mutated then h.totals[tier.."Mutated"]+=1;row[tier.."Mutated"]+=1 end
+                if event.mutated then
+                    h.totals[tier.."Mutated"]+=1;row[tier.."Mutated"]+=1
+                    local name=event.mutation
+                    if type(name)=="string" and #name<=80 and name:match("^[a-z][a-z0-9 %+&'/%._%-]*$") then
+                        row.mutations=row.mutations or {secret={},forgotten={}}
+                        local counts=row.mutations[tier];local kinds=0;for _ in pairs(counts) do kinds+=1 end
+                        if counts[name] or kinds<64 then counts[name]=(counts[name] or 0)+1 end
+                    end
+                end
             end
             if integer(caught) then
                 local previous=h[tier.."Index"]
@@ -2348,7 +2381,11 @@ local Core = (function()
             local open=h.buckets[tostring(current)] or zero(current)
             for _,key in ipairs(keys) do report[key]=h.totals[key]-open[key] end
             for _,tier in ipairs({"secret","forgotten"}) do report[tier.."At"]=h[tier.."At"];report[tier.."Since"]=h[tier.."Since"] end
-            for _,row in pairs(h.buckets) do if row.at<current and row.at>=current-retention then table.insert(report.buckets,table.clone(row)) end end
+            for _,row in pairs(h.buckets) do if row.at<current and row.at>=current-retention then
+                local copy=table.clone(row)
+                if row.mutations then copy.mutations={secret=table.clone(row.mutations.secret),forgotten=table.clone(row.mutations.forgotten)} end
+                table.insert(report.buckets,copy)
+            end end
             table.sort(report.buckets,function(a,b) return a.at<b.at end)
             h.pending=report;return report
         end
@@ -3172,7 +3209,7 @@ local state = {
     observed = Core.eventStore(), equipmentObserved = Core.equipmentEvents(), remoteCount = 0, partial = true,
     cacheReaderProbes = {},
     bag = Core.bagLedger(player.UserId),
-    playerGui = playerGui, revision = 0, statsRevision = 0, collectorVersion = "1.14",
+    playerGui = playerGui, revision = 0, statsRevision = 0, collectorVersion = "1.16",
 }
 if reuse then
     state.bag = previous.bag; Core.bagReindex(state.bag, state.catalog)
@@ -5123,7 +5160,7 @@ do
         local history=Core.rareRestore(env.RENN_STATS_HISTORY[cacheName])
         if not history and type(env.readfile or readfile)=="function" then
             local ok,raw=pcall(env.readfile or readfile,filename)
-            if ok and type(raw)=="string" and #raw<=128000 then
+            if ok and type(raw)=="string" and #raw<=524288 then
                 local decoded,value=pcall(HttpService.JSONDecode,HttpService,raw)
                 if decoded then history=Core.rareRestore(value) end
             end
@@ -5139,7 +5176,7 @@ do
             if type(write)=="function" then
                 local savedHistory=table.clone(history);savedHistory.seen=nil
                 local ok,body=pcall(HttpService.JSONEncode,HttpService,savedHistory)
-                if ok and #body<=128000 then local saved=pcall(write,filename,body);if saved then dirty=false end end
+                if ok and #body<=524288 then local saved=pcall(write,filename,body);if saved then dirty=false end end
             end
             lastSave=os.clock()
         end
@@ -5201,7 +5238,7 @@ do
                 local text=message.Text or "";if not text:lower():find("obtained",1,true) then return end
                 local context=(tostring(message.PrefixText or "").." "..tostring(message.Metadata or "").." "..tostring(message.TextChannel and message.TextChannel.Name or "")):lower()
                 local global=context:match("%f[%a]global%f[%A]") or context:find("globalalerts",1,true)
-                local event=Core.rareMessage(text,player.Name,message.TextSource and message.TextSource.UserId,global~=nil)
+                local event=Core.rareMessage(text,player.Name,message.TextSource and message.TextSource.UserId,global~=nil,player.DisplayName)
                 if not event then return end
                 local token=type(message.MessageId)=="string" and message.MessageId~="" and message.MessageId or HttpService:GenerateGUID(false)
                 local at=os.time();local eventHistory=history
@@ -5271,7 +5308,7 @@ do
     local function metadata(snapshot)
         local ctx = state.autoTrade
         return {username = player.Name, displayName = player.DisplayName, avatar = state.avatar, placeId = game.PlaceId, gameId = game.GameId,
-            jobId = game.JobId, version = "rennstats/1.14", source = state.source, status = state.status,
+            jobId = game.JobId, version = "rennstats/1.16", source = state.source, status = state.status,
             paused = state.paused, lastError = state.lastError, catalogReady = state.catalogReady,
             playerStats = snapshot and snapshot.playerStats or state.playerStats,
             equipment = snapshot and snapshot.equipment or {},
@@ -5283,7 +5320,7 @@ do
     local function briefMetadata()
         local snapshot = state.snapshot
         return {username = player.Name, displayName = player.DisplayName, avatar = state.avatar, placeId = game.PlaceId,
-            gameId = game.GameId, jobId = game.JobId, version = "rennstats/1.14",
+            gameId = game.GameId, jobId = game.JobId, version = "rennstats/1.16",
             playerStats = snapshot and snapshot.playerStats or state.playerStats, equipment = snapshot and snapshot.equipment or {},
             progress = {phase = not snapshot and "Mengambil inventori" or state.DataReady() and "Siap" or "Memetakan informasi item",
                 complete = state.DataReady()}}
