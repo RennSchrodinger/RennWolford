@@ -57,22 +57,66 @@ local function loadQueue()
 end
 local gui=Instance.new("ScreenGui")
 gui.Name="RennAutoPoint";gui.ResetOnSpawn=false;gui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling;gui.Parent=player:WaitForChild("PlayerGui")
-local panel=Instance.new("Frame");panel.Size=UDim2.fromOffset(410,420);panel.Position=UDim2.new(.5,-205,.5,-210);panel.BackgroundColor3=Color3.fromRGB(22,26,28);panel.Parent=gui
-local corner=Instance.new("UICorner");corner.CornerRadius=UDim.new(0,10);corner.Parent=panel
+local panel=Instance.new("Frame");panel.Size=UDim2.fromOffset(410,200);panel.Position=UDim2.new(.5,-205,.5,-100);panel.BackgroundColor3=Color3.fromRGB(22,26,28);panel.Parent=gui
+local corner=Instance.new("UICorner");corner.CornerRadius=UDim.new(0,8);corner.Parent=panel
 local stroke=Instance.new("UIStroke");stroke.Color=Color3.fromRGB(62,73,61);stroke.Parent=panel
 local function label(text,y,height)
-    local l=Instance.new("TextLabel");l.Position=UDim2.fromOffset(20,y);l.Size=UDim2.new(1,-40,0,height or 24);l.BackgroundTransparency=1;l.Text=text;l.Font=Enum.Font.Gotham;l.TextSize=13;l.TextColor3=Color3.fromRGB(230,237,228);l.TextXAlignment=Enum.TextXAlignment.Left;l.TextWrapped=true;l.Parent=panel;return l
+    local l=Instance.new("TextLabel");l.Position=UDim2.fromOffset(16,y);l.Size=UDim2.new(1,-32,0,height or 24);l.BackgroundTransparency=1;l.Text=text;l.Font=Enum.Font.Gotham;l.TextSize=13;l.TextColor3=Color3.fromRGB(230,237,228);l.TextXAlignment=Enum.TextXAlignment.Left;l.TextWrapped=true;l.Parent=panel;return l
 end
-local title=label("RENNHSG / AUTO POINT",16,30);title.TextColor3=Color3.fromRGB(195,239,115);title.Font=Enum.Font.GothamBold
-local code=Instance.new("TextBox");code.Position=UDim2.fromOffset(20,60);code.Size=UDim2.new(1,-40,0,38);code.BackgroundColor3=Color3.fromRGB(34,40,42);code.TextColor3=Color3.fromRGB(238,241,234);code.PlaceholderText="KODE SESSION · XXX-XXX";code.Text="";code.ClearTextOnFocus=false;code.TextSize=17;code.Font=Enum.Font.GothamBold;code.Parent=panel
-local info=label("Masukkan kode session dari panel admin.",154,52)
-local timerLabel=label("SISA WAKTU  —",213,30);timerLabel.Font=Enum.Font.GothamBold;timerLabel.TextSize=20
-local activity=label("Menunggu pertandingan.",345,50)
-local status=label("Key tervalidasi · belum terhubung",395,18);status.TextSize=10
+local title=label("AUTO POINT / CONNECT",12,26);title.Active=true;title.TextColor3=Color3.fromRGB(195,239,115);title.Font=Enum.Font.GothamBold;title.Size=UDim2.fromOffset(310,26);title.TextWrapped=false;title.TextTruncate=Enum.TextTruncate.AtEnd
+local code=Instance.new("TextBox");code.Position=UDim2.fromOffset(16,52);code.Size=UDim2.new(1,-32,0,38);code.BackgroundColor3=Color3.fromRGB(34,40,42);code.TextColor3=Color3.fromRGB(238,241,234);code.PlaceholderText="KODE SESSION · XXX-XXX";code.Text="";code.ClearTextOnFocus=false;code.TextSize=17;code.Font=Enum.Font.GothamBold;code.Parent=panel
+local info=label("",0,20);info.Visible=false
+local timerLabel=label("00:00:00",55,30);timerLabel.Font=Enum.Font.GothamBold;timerLabel.TextSize=24;timerLabel.Visible=false
+local activity=label("Menunggu pertandingan.",147,38);activity.Visible=false
+local status=label("Masukkan kode session dari panel admin.",153,34);status.TextSize=11
+local connectButton,startButton,pauseButton,endButton,minimizeButton
+local minimized=false
+local function layout()
+    local joined=session~=nil
+    panel.Size=UDim2.fromOffset(410,minimized and 48 or joined and 235 or 200)
+    code.Visible=not joined
+    if connectButton then connectButton.Visible=not joined end
+    for _,b in ipairs({startButton,pauseButton,endButton}) do b.Visible=joined and not minimized end
+    if minimizeButton then minimizeButton.Visible=joined;minimizeButton.Text=minimized and "+" or "−" end
+    timerLabel.Visible=joined;activity.Visible=joined and not minimized;status.Visible=not minimized
+    title.Text=joined and session.name or "AUTO POINT / CONNECT"
+    title.Size=UDim2.fromOffset(minimized and 210 or 310,26)
+    timerLabel.Position=UDim2.fromOffset(minimized and 228 or 16,minimized and 13 or 52)
+    timerLabel.Size=UDim2.fromOffset(minimized and 98 or 370,minimized and 22 or 36)
+    timerLabel.TextSize=minimized and 13 or 24
+    status.Position=UDim2.fromOffset(16,joined and 191 or 153)
+    status.Size=UDim2.new(1,-32,0,34)
+end
 local function button(text,x,y,width,fn)
-    local b=Instance.new("TextButton");b.Text=text;b.Position=UDim2.fromOffset(x,y);b.Size=UDim2.fromOffset(width,36);b.BackgroundColor3=Color3.fromRGB(45,57,39);b.TextColor3=Color3.fromRGB(195,239,115);b.Font=Enum.Font.GothamBold;b.TextSize=12;b.Parent=panel
+    local b=Instance.new("TextButton");b.Text=text;b.Position=UDim2.fromOffset(x,y);b.Size=UDim2.fromOffset(width,34);b.BackgroundColor3=Color3.fromRGB(45,57,39);b.TextColor3=Color3.fromRGB(195,239,115);b.Font=Enum.Font.GothamBold;b.TextSize=20;b.Parent=panel
     table.insert(connections,b.MouseButton1Click:Connect(fn));return b
 end
+local avatars={}
+local function populationSnapshot()
+    local roster={}
+    for _,p in ipairs(Players:GetPlayers()) do
+        local character=p.Character
+        table.insert(roster,{display_name=p.DisplayName,username=p.Name,user_id=tostring(p.UserId),
+            character_loaded=character~=nil and character:FindFirstChild("HumanoidRootPart")~=nil,
+            avatar_url=avatars[tostring(p.UserId)] and avatars[tostring(p.UserId)].url or ""})
+    end
+    return roster
+end
+-- Resolve web-compatible avatar URLs in the background; heartbeat never waits on thumbnails.
+task.spawn(function()
+    while alive do
+        if connected then
+            local ids={}
+            for _,p in ipairs(Players:GetPlayers()) do local id=tostring(p.UserId);if not avatars[id] or os.clock()-avatars[id].at>300 then table.insert(ids,id) end end
+            if #ids>0 then pcall(function()
+                local response=requestFn({Url="https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds="..table.concat(ids,",").."&size=48x48&format=Png&isCircular=false",Method="GET",Timeout=8})
+                local result=Http:JSONDecode(response.Body or response.body or "")
+                for _,item in ipairs(result.data or {}) do if item.state=="Completed" and type(item.imageUrl)=="string" then avatars[tostring(item.targetId)]={url=item.imageUrl,at=os.clock()} end end
+            end) end
+        end
+        task.wait(30)
+    end
+end)
 local function serverNow() return clockEpoch+(os.clock()-clockBase) end
 local function timeText(seconds)
     seconds=math.max(0,math.ceil(seconds));return string.format("%02d:%02d:%02d",math.floor(seconds/3600),math.floor(seconds/60)%60,seconds%60)
@@ -80,6 +124,7 @@ end
 local function apply(result)
     session=result.session
     if not session then return end
+    layout()
     clockEpoch=session.server_time;clockBase=os.clock()
     info.Text=session.name.."\nSTATUS: "..session.status.." · "..tostring(#session.participants).." peserta"
     local acknowledged={}
@@ -101,7 +146,7 @@ local function sync(action)
     if busy or not connected then return end
     busy=true
     local ok,err=pcall(function()
-        local roster={};for _,p in ipairs(Players:GetPlayers()) do table.insert(roster,{display_name=p.DisplayName,username=p.Name}) end
+        local roster=populationSnapshot()
         local events={};for i=1,math.min(20,#queue) do table.insert(events,queue[i]);if #Http:JSONEncode(events)>24000 then table.remove(events);break end end
         local result=post({action=action or "sync",session_id=sessionId,token=token,roster=roster,events=events})
         apply(result)
@@ -109,7 +154,7 @@ local function sync(action)
     if not ok then status.Text="Koneksi / aksi gagal: "..tostring(err);if tostring(err):find("Koneksi dicabut",1,true) then connected=false end;saveQueue() end
     busy=false
 end
-button("CONNECT",20,109,370,function()
+connectButton=button("CONNECT",16,101,378,function()
     if busy then return end
     if connected then status.Text="Sudah terhubung. Gunakan START / RESUME.";return end
     busy=true
@@ -120,11 +165,11 @@ button("CONNECT",20,109,370,function()
     if not ok then status.Text=tostring(err) end
     busy=false
 end)
-button("START / RESUME",20,262,370,function()sync("start")end)
-button("PAUSE",20,305,180,function()sync("pause")end)
+startButton=button("▶",16,101,118,function()sync("start")end)
+pauseButton=button("Ⅱ",146,101,118,function()sync("pause")end)
 local endArmed=false
-button("END",210,305,180,function()
-    if not endArmed then endArmed=true;status.Text="Tekan END sekali lagi dalam 4 detik untuk mengakhiri.";task.delay(4,function()endArmed=false end);return end
+endButton=button("■",276,101,118,function()
+    if not endArmed then endArmed=true;status.Text="Tekan ■ sekali lagi dalam 4 detik untuk mengakhiri.";task.delay(4,function()endArmed=false end);return end
     endArmed=false;sync("end")
 end)
 local function strip(text)
@@ -204,7 +249,9 @@ local function close()
     alive=false;saveQueue();for _,c in ipairs(connections)do c:Disconnect()end;gui:Destroy();env.RENN_AUTOPOINT_CLOSE=nil
 end
 env.RENN_AUTOPOINT_CLOSE=close
-button("×",365,18,25,close)
+button("×",375,8,25,close)
+minimizeButton=button("−",340,8,25,function()minimized=not minimized;layout()end)
+layout()
 task.spawn(function()
     while alive do
         if connected then
@@ -220,7 +267,7 @@ task.spawn(function()
     while alive do
         if session then
             local left=session.remaining-(session.status=="RUNNING" and (os.clock()-clockBase) or 0)
-            timerLabel.Text="SISA WAKTU  "..timeText(left)
+            timerLabel.Text=timeText(left)
         end
         task.wait(.25)
     end
